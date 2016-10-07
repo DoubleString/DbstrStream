@@ -5,9 +5,6 @@
  *      Author: doublestring
  */
 
-
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -26,11 +23,14 @@
 
 #define STREAM_TCP 1
 
-#define MODE_SVR (STREAM_TCP+1)
-#define MODE_CLI (MODE_SVR+1)
+#define MODE_TCPSVR (STREAM_TCP+1)
+#define MODE_TCPCLI (MODE_TCPSVR+1)
+
+#define MODE_NTRIPCLI (MODE_TCPCLI+1)
+#define MODE_NTRIPSVR (MODE_NTRIPCLI+1)
 
 #define payloadsize 1024
-
+#define maxstrsize 256
 #define floor(f) ((int)(f>(int)f ? f+1:f))
 #ifdef WIN32
 
@@ -43,6 +43,11 @@
 #endif
 static int ticonnect = 10000;
 
+static char ICY_OK[]="ICY 200 OK";
+static char ICY_UN[]="Unauthorized";
+static char ICY_SOURCE[]="SOURCETABLE";
+
+
 #define MAXEPOLL 1024
 typedef void (*dataRecvCallback)(char *buff, int n, void* arg);
 
@@ -52,7 +57,7 @@ typedef struct {
 	int port;
 	struct sockaddr_in addr;
 	socket_t sock;
-	int tcon; /*reconnect time (ms) (-1:never,0:now)*/
+
 	unsigned int tact; /*data active tick*/
 	unsigned int tdis; /*disconnect tick*/
 } tcp_t;
@@ -71,6 +76,9 @@ typedef struct {
 	int snredy; /*flag for whether the send buffer is ready*/
 
 	dataRecvCallback callback; /*callback for client mode*/
+
+	void* host;
+	pthread_t pth_recon;
 } tcpcli_t;
 
 typedef struct {
@@ -85,7 +93,19 @@ typedef struct {
 
 	lock_t syncsvr;
 } tcpsvr_t;
+typedef struct {
+	tcpcli_t *cli;
+	char psd[maxstrsize];
+	char usr[maxstrsize];
+	char mountpoint[maxstrsize];
+	int state; /*0:close 1:wait 2:connect*/
+	void* host;
+} ntrip_t;
 
+typedef struct {
+	struct list_head list;
+	ntrip_t ntrcli;
+} ntrip_list;
 typedef struct {
 	int type;
 	int mode;
@@ -93,8 +113,8 @@ typedef struct {
 	union {
 		tcpcli_list *cliHead;
 		tcpsvr_t *svr;
+		ntrip_list *ntrHead;
 	} prot;
-
 	lock_t synlock;
 } stream_t;
 
@@ -181,7 +201,6 @@ static int gentcp(tcp_t *tcp, int type) {
 			printf("address error (%s)", tcp->saddr);
 			closesocket(tcp->sock);
 			tcp->state = 0;
-			tcp->tcon = ticonnect;
 			tcp->tdis = tickget();
 			return 0;
 		}
@@ -195,17 +214,15 @@ static int gentcp(tcp_t *tcp, int type) {
 	return 1;
 }
 
-static tcpcli_t* opentcpcli() {
+static tcpcli_t* opentcpcli(char *addr,int port) {
 	tcpcli_t* tcpcli, tcpcli0 = { { 0 } };
 	if (!(tcpcli = (tcpcli_t*) malloc(sizeof(tcpcli_t)))) {
 		printf("malloc error!\n");
 		return NULL;
 	}
 	*tcpcli = tcpcli0;
-
-	strcpy(tcpcli->cli.saddr, "127.0.0.1");
-	tcpcli->cli.port = 8002;
-
+	strcpy(tcpcli->cli.saddr,addr);
+	tcpcli->cli.port=port;
 	if (!gentcp(&tcpcli->cli, 1)) {
 		free(tcpcli);
 		tcpcli = NULL;
@@ -213,8 +230,9 @@ static tcpcli_t* opentcpcli() {
 	}
 
 	tcpcli->inactinv = 1000 * 3600;
-	tcpcli->reconinv = 1000 * 10;
+	tcpcli->reconinv = 1000;
 	tcpcli->snredy = 1;
+	tcpcli->pth_recon = -1;
 	/*init lock*/
 	initlock(&tcpcli->synccli);
 	/*init queue*/
@@ -225,18 +243,21 @@ static tcpcli_t* opentcpcli() {
 
 static int connect_nb(tcp_t* tcp) {
 	errno = 0;
+	tcp->state = 0;
 	int rc = connect(tcp->sock, (struct sockaddr*) &tcp->addr,
 			sizeof(tcp->addr));
 	if (rc == -1) {
-		if (errno != EINPROGRESS) {
-			return 0;
+		if (errno == EINPROGRESS) {
+			tcp->state = 1;
+			return 1;
 		}
 	} else if (rc == 0) {
 		tcp->state = 2;
 		printf(
 				"no-blocking connect success! connect to the svr immediately!\n");
+		return 2;
 	}
-	return 1;
+	return 0;
 }
 
 static tcpsvr_t* opentcpsvr(char *addr, int port) {
@@ -251,7 +272,6 @@ static tcpsvr_t* opentcpsvr(char *addr, int port) {
 		tcpsvr = NULL;
 		return NULL;
 	}
-	tcpsvr->svr.tcon = 0;
 	initlock(&tcpsvr->syncsvr);
 	list_init(&(tcpsvr->clients.list));
 	return tcpsvr;
@@ -308,7 +328,6 @@ static int accept_nb(stream_t* stream) {
 		/*update socket configure*/
 		cli->cli.sock = fd;
 		cli->cli.state = 2;
-		cli->cli.tcon = cli->reconinv ? -1 : 0;
 
 		cli->cli.tact = tickget();
 		memcpy(&(cli->cli.addr), &addr, sizeof(addr));
@@ -410,7 +429,7 @@ static int send_nb(tcpcli_t* cli, char* buff, int len) {
 		num = floor((len+0.0) / payloadsize);
 		for (i = 0; i < num; i++) {
 			payload = (packet_list*) malloc(sizeof(packet_list));
-			memcpy(payload->buff, buff+i*payloadsize,
+			memcpy(payload->buff, buff + i * payloadsize,
 					i == num - 1 ? len - i * payloadsize : payloadsize);
 			payload->n = i == num - 1 ? len - i * payloadsize : payloadsize;
 			list_add_tail(&payload->list, &cli->sndpkt.list);
@@ -506,7 +525,7 @@ static int starttcpsvr() {
 	stream.prot.svr = svr;
 
 	struct epoll_event events[MAXEPOLL], ev;
-	stream.mode = MODE_SVR;
+	stream.mode = MODE_TCPSVR;
 	stream.efd = epoll_create(MAXEPOLL);
 
 	ev.events = EPOLLIN | EPOLLET;
@@ -549,9 +568,6 @@ static int starttcpsvr() {
 	return 1;
 }
 
-
-
-
 static int testcon_cli(socket_t fd) {
 	int status, err;
 	int len = sizeof(int);
@@ -568,32 +584,93 @@ static int testcon_cli(socket_t fd) {
 	printf("no-blocking connect success!\n");
 	return 2;
 }
+static int discont_cli(stream_t* stream, tcpcli_t* cli) {
+	lock(&stream->synlock);
+
+	unlock(&stream->synlock);
+	return 1;
+
+}
+
+static void openntrip(ntrip_t* ptrntr){
+	char cmd[maxstrsize],*base64,req[maxstrsize];
+	sprintf(cmd,"%s:%s",ptrntr->usr,ptrntr->psd);
+	base64=base64_encode(cmd,strlen(cmd));
+	sprintf(req,"GET /%s HTTP/1.0\r\nUser-Agent: NTRIP GNSSInternetRadio/1.2.0\r\nAuthorization: Basic %s\r\n\r\n",
+			ptrntr->mountpoint,base64);
+	send_nb(ptrntr->cli,req,strlen(req));
+}
+void recon_callback(void* arg) {
+	tcpcli_t* ptrcli = (tcpcli_t*) arg;
+	ntrip_t* ntrcli = (ntrip_t*) ptrcli->host;
+
+	stream_t* stream=ntrcli->host;
+
+	struct epoll_event ev;
+	if (!gentcp(&ptrcli->cli, 1)) {
+		/*disconnect cli*/
+		printf("disconnect client %d!\n", ptrcli->cli.sock);
+		ntrcli->state=0;
+		ptrcli->cli.state=0;
+		ptrcli->pth_recon=-1;
+		return;
+	}
+	do {
+		if (ptrcli->reconinv != 0) {
+			usleep(ptrcli->reconinv * 1000);
+			printf("enter reconnect process\n");
+		} else
+			usleep(100 * 1000);
+	} while (!(ntrcli->state=connect_nb(&ptrcli->cli)));
+	ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+	switch(stream->mode){
+		case MODE_TCPCLI:
+		case MODE_TCPSVR:   ev.data.ptr = (void*) ptrcli; break;
+		case MODE_NTRIPCLI:
+		case MODE_NTRIPSVR: ev.data.ptr = (void*) ntrcli;   break;
+	}
+	epoll_ctl(stream->efd, EPOLL_CTL_ADD, ptrcli->cli.sock, &ev);
+	/*in case of connecting immediately*/
+	if(ntrcli->state==2){
+		openntrip(ntrcli);
+	}
+	ptrcli->pth_recon = -1;
+	printf("connect process success!\n");
+}
 static int recon_cli(tcpcli_t* cli) {
+	pthread_t pth_t;
+	if (cli->pth_recon == -1) {
+		cli->cli.state = 1;
+		if (-1
+				== pthread_create(&cli->pth_recon, NULL, recon_callback,
+						(void*) cli)) {
+			printf("thread for reconnect failed!\n");
+			cli->pth_recon = -1;
+			cli->cli.state = 0;
+			((ntrip_t*)cli->host)->state=0;
+			/*create thread failed remove the client*/
+//			discont_cli((stream_t*)((ntrip_t*) cli->host)->host, cli);
+			return 0;
+		}
+	}
+}
+static int shutdowntcp_cli(stream_t* stream) {
 
 }
-static int shutdowntcp_cli(stream_t* stream){
-
-}
-static int discont_cli(stream_t* stream,tcpcli_t* cli){
-
-
-}
-
 
 static void send_cli(stream_t *stream, char* buffer, int n) {
 	/*lock in case of free tcpcli*/
 	lock(&stream->synlock);
 	tcpcli_list *cliHead = stream->prot.cliHead;
 	tcpcli_list *pos = NULL;
-	list_for_each_entry(pos,&cliHead->list,list){
-		if (pos->client->cli.state == 2){
+	list_for_each_entry(pos,&cliHead->list,list)
+	{
+		if (pos->client->cli.state == 2) {
 			send_nb(pos->client, buffer, n);
 		}
 	}
 	unlock(&stream->synlock);
 }
-
-
 
 static int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
 	tcpcli_t *cli, *ptrcli;
@@ -601,7 +678,7 @@ static int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
 	char buffer[payloadsize];
 	struct epoll_event events[MAXEPOLL], ev;
 	/********************************INIT-CONFIG***********************************************/
-	stream->mode = MODE_CLI;
+	stream->mode = MODE_TCPCLI;
 	stream->type = STREAM_TCP;
 	stream->efd = epoll_create(MAXEPOLL);
 	stream->prot.cliHead = (tcpcli_list*) malloc(sizeof(tcpcli_list));
@@ -609,30 +686,36 @@ static int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
 	initlock(&stream->synlock);
 	/*********************************READ-CONFIG-FILE*****************************************/
 
-
-
-
 	/******************************************************************************************/
+	lock(&stream->synlock); /*lock because reconnect thread may change the stream.prot.cliHead*/
 	for (i = 0; i < ncli; i++) {
-		if (!(cli = opentcpcli())) {
+		if (!(cli = opentcpcli("127.0.0.1",8002))) {
 			printf("failed to opencli!\n");
 			continue;
 		}
+		cli->host = (void*) stream;
 		printf("opencli successfully! fd id:%d \n", cli->cli.sock);
 		if (callback != NULL)
 			cli->callback = callback;
-		ev.events = EPOLLIN | EPOLLOUT |EPOLLET;
+		ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
 		ev.data.ptr = (void*) cli;
 		epoll_ctl(stream->efd, EPOLL_CTL_ADD, cli->cli.sock, &ev);
-		if (!connect_nb(&cli->cli)) {
-			printf("sock %d connect failed! now continue!\n", cli->cli.sock);
-			continue;
-		}
+
 		/*add to the stream*/
 		tcpcli_list* tcpcli = (tcpcli_list*) malloc(sizeof(tcpcli_list));
 		tcpcli->client = cli;
 		list_add_tail(&tcpcli->list, &stream->prot.cliHead->list);
+
+		if (!connect_nb(&cli->cli)) {
+			printf("sock %d connect failed! now trying to reconnect!\n",
+					cli->cli.sock);
+			epoll_ctl(stream->efd, EPOLL_CTL_DEL, cli->cli.sock, NULL);
+			recon_cli(cli);
+			continue;
+		}
 	}
+	unlock(&stream->synlock);
+
 	while (1) {
 		nfd = epoll_wait(stream->efd, events, MAXEPOLL, -1); /*infinite wait until it is ready*/
 		for (i = 0; i < nfd; i++) {
@@ -641,13 +724,14 @@ static int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
 			if (events[i].events & EPOLLERR) {
 				if (ptrcli->cli.state != 2) {
 					if (!(ret = testcon_cli(fd))) {
-
 						/*ENTER RECONNECT PROCESS*/
 						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
 						close(fd);
+						recon_cli(ptrcli);
 						break;
 					}
-					ptrcli->cli.state = ret;
+					if (ret == 2)
+						ptrcli->cli.state = 2;
 					if (ret < 2)
 						break;
 				}
@@ -658,9 +742,11 @@ static int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
 						/*ENTER RECONNECT PROCESS*/
 						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
 						close(fd);
+						recon_cli(ptrcli);
 						break;
 					}
-					ptrcli->cli.state = ret;
+					if (ret == 2)
+						ptrcli->cli.state = 2;
 					if (ret < 2)
 						break;
 				}
@@ -672,7 +758,8 @@ static int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
 						break;
 					} else if (nread <= 0) {
 						/*ENTER RECONNECT PROCESS*/
-						fclose(fd);
+						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
+						close(fd);
 						ptrcli->cli.state = 0;
 						recon_cli(ptrcli);
 						break;
@@ -688,9 +775,11 @@ static int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
 						/*ENTER RECONNECT PROCESS*/
 						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
 						close(fd);
+						recon_cli(ptrcli);
 						break;
 					}
-					ptrcli->cli.state = ret;
+					if (ret == 2)
+						ptrcli->cli.state = 2;
 					if (ret < 2)
 						break;
 				}
@@ -700,22 +789,11 @@ static int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
 	}
 	return 1;
 }
-
-
-
-
-
-
-
-
-
-
-
 /************************************************TEST FOR NO-BLOCKING TCP CLIENT*****************************************************************************/
 static void callback(char* buffer, int n, void* arg) {
 #define maxfd 20
 
-	int fd=*(int*)arg;
+	int fd = *(int*) arg;
 	static FILE* fp[maxfd];
 	static int fdarray[maxfd] = { 0 };
 	int i;
@@ -737,35 +815,35 @@ static void callback(char* buffer, int n, void* arg) {
 	fflush(fp[i]);
 }
 void pth_recv(void* arg) {
-	int ncli = 30;
-	stream_t *stream = (stream_t*)arg;
-	starttcpcli(stream,callback,ncli);
+	int ncli = 1;
+	stream_t *stream = (stream_t*) arg;
+	starttcpcli(stream, callback, ncli);
 }
 
-int main(int argc,char *args[]){
+int ma_in(int argc, char *args[]) {
 	pthread_t pth_t;
 	stream_t stream;
 	FILE *fp;
-	char buffer[payloadsize*5];
+	char buffer[payloadsize * 5];
 	int len;
-	if(-1==pthread_create(&pth_t,NULL,pth_recv,&stream)){
+	if (-1 == pthread_create(&pth_t, NULL, pth_recv, &stream)) {
 		perror("cant create thread for cli!\n");
 		exit(1);
 	}
-	FILE* savfile=fopen("/home/doublestring/savfile","w");
-	while(1){
+	FILE* savfile = fopen("/home/doublestring/savfile", "w");
+	while (1) {
 		printf("Please input the filename:\n");
-		scanf("%s",buffer);
-		if(!(fp=fopen(buffer,"r"))){
-			printf("cant open file %s to read!\n",buffer);
+		scanf("%s", buffer);
+		if (!(fp = fopen(buffer, "r"))) {
+			printf("cant open file %s to read!\n", buffer);
 			continue;
 		}
 		printf("enter to continue");
 		getchar();
-		while(!feof(fp)){
-			len=fread(buffer,sizeof(char),payloadsize*5,fp);
-			send_cli(&stream,buffer,len);
-			fwrite(buffer,sizeof(char),len,savfile);
+		while (!feof(fp)) {
+			len = fread(buffer, sizeof(char), payloadsize * 5, fp);
+			send_cli(&stream, buffer, len);
+			fwrite(buffer, sizeof(char), len, savfile);
 			fflush(savfile);
 		}
 		fclose(fp);
@@ -778,10 +856,238 @@ int main(int argc,char *args[]){
 
 
 
+/**************************************************************MULTI-NTRIP-CLIENT*************************************************************************/
+int modified_julday(int iyear, int imonth, int iday) {
+	int iyr, result;
+	int doy_of_month[12] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304,
+			334 };
+	if (iyear < 0 || imonth < 0 || iday < 0 || imonth > 12 || iday > 366
+			|| (imonth != 0 && iday > 31)) {
+		printf("ERROR(modified_julday)incorrect input arguments!%d %d %d\n",
+				iyear, imonth, iday);
+		exit(1);
+	}
+	iyr = iyear;
+	if (imonth <= 2)
+		iyr -= 1;
+	result = 365 * iyear - 678941 + iyr / 4 - iyr / 100 + iyr / 400 + iday;
+
+	if (imonth != 0)
+		result = result + doy_of_month[imonth - 1];
+
+	return result;
+
+}
+void mjd2doy(int jd, int* iyear, int* idoy) {
+	*iyear = (jd + 678940) / 365;
+	*idoy = jd - modified_julday(*iyear, 1, 1);
+	while (*idoy < 0) {
+		(*iyear)--;
+		*idoy = jd - modified_julday(*iyear, 1, 1) + 1;
+	}
+
+}
+int run_tim() {
+	struct tm *ptr;
+	time_t rawtime;
+	time(&rawtime);
+	ptr = localtime(&rawtime);
+	int iyear,idoy;
+	int mjd=modified_julday(ptr->tm_year+1900,ptr->tm_mon+1,ptr->tm_mday);
+	mjd2doy(mjd,&iyear,&idoy);
+	return idoy;
+}
+static void ntrrecv_callback(char* buffer,int n,void* arg){
+	ntrip_t* ptrntr = (ntrip_t*) arg;
+	static FILE*fp=NULL;
+	static int id;
+	if(ptrntr->state<=0)
+		return;
+	if(ptrntr->state==1){
+		printf("%s",buffer);
+		if (strstr(buffer, ICY_OK) != NULL){
+			ptrntr->state=2;
+		}
+		else if (strstr(buffer, ICY_UN) != NULL) {
+			printf("登录信息错误,请检查用户名,密码,挂载点是否输入正确!\n");
+
+		} else if (strstr(buffer, ICY_SOURCE) != NULL) {
+			printf("请选择挂载点!");
+		}
+		return;
+	}
+
+	int iday=run_tim();
+	char buff[1024];
+	if (id != iday) {
+		if(fp)
+			fclose(fp);
+		sprintf(buff,"savfile_%s_%d",ptrntr->mountpoint,iday);
+		if(!(fp=fopen(buff,"w"))){
+			printf("cant open file to write :%s \n",buff);
+			exit(1);
+		}
+		id=iday;
+	}
+
+	fwrite(buffer,sizeof(char),n,fp);
+	fflush(fp);
+}
+static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) {
+	tcpcli_t *cli,*ptrcli;
+	ntrip_t *ptrntr,ptrntr0={{0}};
+	int nfd, i, fd, nread, ret;
+	char buffer[payloadsize];
+	struct epoll_event events[MAXEPOLL], ev;
+	/********************************INIT-CONFIG***********************************************/
+	stream->mode = MODE_NTRIPCLI;
+	stream->type = STREAM_TCP;
+	stream->efd = epoll_create(MAXEPOLL);
+
+	stream->prot.ntrHead=(ntrip_list*)malloc(sizeof(ntrip_list));
+	list_init(&stream->prot.ntrHead->list);
+	initlock(&stream->synlock);
+	/*********************************READ-CONFIG-FILE*****************************************/
+
+	/******************************************************************************************/
+	lock(&stream->synlock); /*lock because reconnect thread may change the stream.prot.cliHead*/
+	for (i = 0; i < ncli; i++) {
+		if (!(cli = opentcpcli("59.175.223.165",2101))) {
+			printf("failed to opencli!\n");
+			continue;
+		}
+
+		printf("opencli successfully! fd id:%d \n", cli->cli.sock);
+		if (callback != NULL)
+			cli->callback = callback;
+
+		/*add to the stream*/
+		ntrip_list* ntrlist = (ntrip_list*)malloc(sizeof(ntrip_list));
+		ntrlist->ntrcli=ptrntr0;
+
+		/*add for test*/
+		strcpy(ntrlist->ntrcli.mountpoint,"QLZ1");
+		strcpy(ntrlist->ntrcli.usr,"dd");
+		strcpy(ntrlist->ntrcli.psd,"111111");
+		strcpy(cli->cli.saddr,"58.49.58.149");
+		cli->cli.port=2101;
 
 
 
 
+		ntrlist->ntrcli.cli=cli;
+		ntrlist->ntrcli.host=(void*)stream;
+		list_add_tail(&ntrlist->list,&stream->prot.ntrHead->list);
+		cli->host = (void*)&ntrlist->ntrcli;
+		ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+		ev.data.ptr = (void*)&ntrlist->ntrcli;
+		epoll_ctl(stream->efd, EPOLL_CTL_ADD, cli->cli.sock, &ev);
+
+		if (!(ntrlist->ntrcli.state=connect_nb(&cli->cli))) {
+			printf("sock %d connect failed! now trying to reconnect!\n",
+					cli->cli.sock);
+			epoll_ctl(stream->efd, EPOLL_CTL_DEL, cli->cli.sock, NULL);
+			recon_cli(cli);
+			continue;
+		}
+		if(ntrlist->ntrcli.state==2){
+			openntrip(&ntrlist->ntrcli);
+		}
+	}
+	unlock(&stream->synlock);
+
+	while (1) {
+		nfd = epoll_wait(stream->efd, events, MAXEPOLL, -1); /*infinite wait until it is ready*/
+		for (i = 0; i < nfd; i++) {
+			ptrntr = (ntrip_t*)events[i].data.ptr;
+			ptrcli=ptrntr->cli;
+			fd = ptrcli->cli.sock;
+			if (events[i].events & EPOLLERR) {
+				if (ptrcli->cli.state != 2) {
+					if (!(ret = testcon_cli(fd))) {
+						/*ENTER RECONNECT PROCESS*/
+						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
+						close(fd);
+						recon_cli(ptrcli);
+						break;
+					}
+					if (ret == 2){
+						ptrcli->cli.state = 2;
+						ptrntr->state=1;
+						/*open ntrip config*/
+						openntrip(ptrntr);
+					}
+					if (ret < 2)
+						break;
+				}
+			}
+			if (events[i].events & EPOLLIN) {
+				if (ptrcli->cli.state != 2) {
+					if (!(ret = testcon_cli(fd))) {
+						/*ENTER RECONNECT PROCESS*/
+						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
+						close(fd);
+						recon_cli(ptrcli);
+						break;
+					}
+					if (ret == 2){
+						ptrcli->cli.state = 2;
+						ptrntr->state=1;
+						/*open ntrip config*/
+						openntrip(ptrntr);
+					}
+					if (ret < 2)
+						break;
+				}
+				while (1) {
+					nread = recv(fd, buffer, sizeof(buffer), 0);
+					if (nread < 0
+							&& ( errno == EINTR || errno == EWOULDBLOCK
+									|| errno == EAGAIN)) {
+						break;
+					} else if (nread <= 0) {
+						/*ENTER RECONNECT PROCESS*/
+						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
+						close(fd);
+						ptrcli->cli.state = 0;
+						ptrntr->state=0;
+						recon_cli(ptrcli);
+						break;
+					}
+					if (ptrcli->callback != NULL) {
+						ptrcli->callback(buffer, nread, (void*)ptrntr);
+					}
+				}
+			}
+			if (events[i].events & EPOLLOUT) {
+				if (ptrcli->cli.state != 2) {
+					if (!(ret = testcon_cli(fd))) {
+						/*ENTER RECONNECT PROCESS*/
+						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
+						close(fd);
+						recon_cli(ptrcli);
+						break;
+					}
+					if (ret == 2){
+						ptrcli->cli.state = 2;
+						ptrntr->state=1;
+						/*connect success!*/
+						openntrip(ptrntr);
+					}
+					if (ret < 2)
+						break;
+				}
+				send_packet(ptrcli);
+			}
+		}
+	}
+	return 1;
+}
+
+int main(){
+	stream_t stream;
+	startntripcli(&stream,ntrrecv_callback,1);
+}
 
 
 
