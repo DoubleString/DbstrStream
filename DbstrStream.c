@@ -100,12 +100,12 @@ typedef struct {
 	char mountpoint[maxstrsize];
 	int state; /*0:close 1:wait 2:connect*/
 	void* host;
-} ntrip_t;
+} ntrip_cli_t;
 
 typedef struct {
 	struct list_head list;
-	ntrip_t ntrcli;
-} ntrip_list;
+	ntrip_cli_t ntrcli;
+} ntrip_cli_list;
 typedef struct {
 	int type;
 	int mode;
@@ -113,7 +113,7 @@ typedef struct {
 	union {
 		tcpcli_list *cliHead;
 		tcpsvr_t *svr;
-		ntrip_list *ntrHead;
+		ntrip_cli_list *ntrHead;
 	} prot;
 	lock_t synlock;
 } stream_t;
@@ -124,7 +124,6 @@ typedef struct {
 static int errsock(void) {
 	return errno;
 }
-
 #endif
 /* get tick time ---------------------------------------------------------------
  * get current tick in ms
@@ -592,25 +591,15 @@ static int discont_cli(stream_t* stream, tcpcli_t* cli) {
 
 }
 
-static void openntrip(ntrip_t* ptrntr){
-	char cmd[maxstrsize],*base64,req[maxstrsize];
-	sprintf(cmd,"%s:%s",ptrntr->usr,ptrntr->psd);
-	base64=base64_encode(cmd,strlen(cmd));
-	sprintf(req,"GET /%s HTTP/1.0\r\nUser-Agent: NTRIP GNSSInternetRadio/1.2.0\r\nAuthorization: Basic %s\r\n\r\n",
-			ptrntr->mountpoint,base64);
-	send_nb(ptrntr->cli,req,strlen(req));
-}
-void recon_callback(void* arg) {
+static void recon_callback(void* arg) {
 	tcpcli_t* ptrcli = (tcpcli_t*) arg;
-	ntrip_t* ntrcli = (ntrip_t*) ptrcli->host;
 
-	stream_t* stream=ntrcli->host;
-
+	stream_t* stream=(stream_t*)ptrcli->host;
 	struct epoll_event ev;
 	if (!gentcp(&ptrcli->cli, 1)) {
 		/*disconnect cli*/
 		printf("disconnect client %d!\n", ptrcli->cli.sock);
-		ntrcli->state=0;
+
 		ptrcli->cli.state=0;
 		ptrcli->pth_recon=-1;
 		return;
@@ -621,19 +610,10 @@ void recon_callback(void* arg) {
 			printf("enter reconnect process\n");
 		} else
 			usleep(100 * 1000);
-	} while (!(ntrcli->state=connect_nb(&ptrcli->cli)));
+	} while (!connect_nb(&ptrcli->cli));
 	ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-	switch(stream->mode){
-		case MODE_TCPCLI:
-		case MODE_TCPSVR:   ev.data.ptr = (void*) ptrcli; break;
-		case MODE_NTRIPCLI:
-		case MODE_NTRIPSVR: ev.data.ptr = (void*) ntrcli;   break;
-	}
+	ev.data.ptr = (void*) ptrcli;
 	epoll_ctl(stream->efd, EPOLL_CTL_ADD, ptrcli->cli.sock, &ev);
-	/*in case of connecting immediately*/
-	if(ntrcli->state==2){
-		openntrip(ntrcli);
-	}
 	ptrcli->pth_recon = -1;
 	printf("connect process success!\n");
 }
@@ -647,7 +627,6 @@ static int recon_cli(tcpcli_t* cli) {
 			printf("thread for reconnect failed!\n");
 			cli->pth_recon = -1;
 			cli->cli.state = 0;
-			((ntrip_t*)cli->host)->state=0;
 			/*create thread failed remove the client*/
 //			discont_cli((stream_t*)((ntrip_t*) cli->host)->host, cli);
 			return 0;
@@ -852,242 +831,6 @@ int ma_in(int argc, char *args[]) {
 }
 
 /*********************************************************************************************************************************************************/
-
-
-
-
-/**************************************************************MULTI-NTRIP-CLIENT*************************************************************************/
-int modified_julday(int iyear, int imonth, int iday) {
-	int iyr, result;
-	int doy_of_month[12] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304,
-			334 };
-	if (iyear < 0 || imonth < 0 || iday < 0 || imonth > 12 || iday > 366
-			|| (imonth != 0 && iday > 31)) {
-		printf("ERROR(modified_julday)incorrect input arguments!%d %d %d\n",
-				iyear, imonth, iday);
-		exit(1);
-	}
-	iyr = iyear;
-	if (imonth <= 2)
-		iyr -= 1;
-	result = 365 * iyear - 678941 + iyr / 4 - iyr / 100 + iyr / 400 + iday;
-
-	if (imonth != 0)
-		result = result + doy_of_month[imonth - 1];
-
-	return result;
-
-}
-void mjd2doy(int jd, int* iyear, int* idoy) {
-	*iyear = (jd + 678940) / 365;
-	*idoy = jd - modified_julday(*iyear, 1, 1);
-	while (*idoy < 0) {
-		(*iyear)--;
-		*idoy = jd - modified_julday(*iyear, 1, 1) + 1;
-	}
-
-}
-int run_tim() {
-	struct tm *ptr;
-	time_t rawtime;
-	time(&rawtime);
-	ptr = localtime(&rawtime);
-	int iyear,idoy;
-	int mjd=modified_julday(ptr->tm_year+1900,ptr->tm_mon+1,ptr->tm_mday);
-	mjd2doy(mjd,&iyear,&idoy);
-	return idoy;
-}
-static void ntrrecv_callback(char* buffer,int n,void* arg){
-	ntrip_t* ptrntr = (ntrip_t*) arg;
-	static FILE*fp=NULL;
-	static int id;
-	if(ptrntr->state<=0)
-		return;
-	if(ptrntr->state==1){
-		printf("%s",buffer);
-		if (strstr(buffer, ICY_OK) != NULL){
-			ptrntr->state=2;
-		}
-		else if (strstr(buffer, ICY_UN) != NULL) {
-			printf("登录信息错误,请检查用户名,密码,挂载点是否输入正确!\n");
-
-		} else if (strstr(buffer, ICY_SOURCE) != NULL) {
-			printf("请选择挂载点!");
-		}
-		return;
-	}
-
-	int iday=run_tim();
-	char buff[1024];
-	if (id != iday) {
-		if(fp)
-			fclose(fp);
-		sprintf(buff,"savfile_%s_%d",ptrntr->mountpoint,iday);
-		if(!(fp=fopen(buff,"w"))){
-			printf("cant open file to write :%s \n",buff);
-			exit(1);
-		}
-		id=iday;
-	}
-
-	fwrite(buffer,sizeof(char),n,fp);
-	fflush(fp);
-}
-static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) {
-	tcpcli_t *cli,*ptrcli;
-	ntrip_t *ptrntr,ptrntr0={{0}};
-	int nfd, i, fd, nread, ret;
-	char buffer[payloadsize];
-	struct epoll_event events[MAXEPOLL], ev;
-	/********************************INIT-CONFIG***********************************************/
-	stream->mode = MODE_NTRIPCLI;
-	stream->type = STREAM_TCP;
-	stream->efd = epoll_create(MAXEPOLL);
-
-	stream->prot.ntrHead=(ntrip_list*)malloc(sizeof(ntrip_list));
-	list_init(&stream->prot.ntrHead->list);
-	initlock(&stream->synlock);
-	/*********************************READ-CONFIG-FILE*****************************************/
-
-	/******************************************************************************************/
-	lock(&stream->synlock); /*lock because reconnect thread may change the stream.prot.cliHead*/
-	for (i = 0; i < ncli; i++) {
-		if (!(cli = opentcpcli("59.175.223.165",2101))) {
-			printf("failed to opencli!\n");
-			continue;
-		}
-
-		printf("opencli successfully! fd id:%d \n", cli->cli.sock);
-		if (callback != NULL)
-			cli->callback = callback;
-
-		/*add to the stream*/
-		ntrip_list* ntrlist = (ntrip_list*)malloc(sizeof(ntrip_list));
-		ntrlist->ntrcli=ptrntr0;
-
-		/*add for test*/
-		strcpy(ntrlist->ntrcli.mountpoint,"QLZ1");
-		strcpy(ntrlist->ntrcli.usr,"dd");
-		strcpy(ntrlist->ntrcli.psd,"111111");
-		strcpy(cli->cli.saddr,"58.49.58.149");
-		cli->cli.port=2101;
-
-
-
-
-		ntrlist->ntrcli.cli=cli;
-		ntrlist->ntrcli.host=(void*)stream;
-		list_add_tail(&ntrlist->list,&stream->prot.ntrHead->list);
-		cli->host = (void*)&ntrlist->ntrcli;
-		ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-		ev.data.ptr = (void*)&ntrlist->ntrcli;
-		epoll_ctl(stream->efd, EPOLL_CTL_ADD, cli->cli.sock, &ev);
-
-		if (!(ntrlist->ntrcli.state=connect_nb(&cli->cli))) {
-			printf("sock %d connect failed! now trying to reconnect!\n",
-					cli->cli.sock);
-			epoll_ctl(stream->efd, EPOLL_CTL_DEL, cli->cli.sock, NULL);
-			recon_cli(cli);
-			continue;
-		}
-		if(ntrlist->ntrcli.state==2){
-			openntrip(&ntrlist->ntrcli);
-		}
-	}
-	unlock(&stream->synlock);
-
-	while (1) {
-		nfd = epoll_wait(stream->efd, events, MAXEPOLL, -1); /*infinite wait until it is ready*/
-		for (i = 0; i < nfd; i++) {
-			ptrntr = (ntrip_t*)events[i].data.ptr;
-			ptrcli=ptrntr->cli;
-			fd = ptrcli->cli.sock;
-			if (events[i].events & EPOLLERR) {
-				if (ptrcli->cli.state != 2) {
-					if (!(ret = testcon_cli(fd))) {
-						/*ENTER RECONNECT PROCESS*/
-						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
-						close(fd);
-						recon_cli(ptrcli);
-						break;
-					}
-					if (ret == 2){
-						ptrcli->cli.state = 2;
-						ptrntr->state=1;
-						/*open ntrip config*/
-						openntrip(ptrntr);
-					}
-					if (ret < 2)
-						break;
-				}
-			}
-			if (events[i].events & EPOLLIN) {
-				if (ptrcli->cli.state != 2) {
-					if (!(ret = testcon_cli(fd))) {
-						/*ENTER RECONNECT PROCESS*/
-						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
-						close(fd);
-						recon_cli(ptrcli);
-						break;
-					}
-					if (ret == 2){
-						ptrcli->cli.state = 2;
-						ptrntr->state=1;
-						/*open ntrip config*/
-						openntrip(ptrntr);
-					}
-					if (ret < 2)
-						break;
-				}
-				while (1) {
-					nread = recv(fd, buffer, sizeof(buffer), 0);
-					if (nread < 0
-							&& ( errno == EINTR || errno == EWOULDBLOCK
-									|| errno == EAGAIN)) {
-						break;
-					} else if (nread <= 0) {
-						/*ENTER RECONNECT PROCESS*/
-						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
-						close(fd);
-						ptrcli->cli.state = 0;
-						ptrntr->state=0;
-						recon_cli(ptrcli);
-						break;
-					}
-					if (ptrcli->callback != NULL) {
-						ptrcli->callback(buffer, nread, (void*)ptrntr);
-					}
-				}
-			}
-			if (events[i].events & EPOLLOUT) {
-				if (ptrcli->cli.state != 2) {
-					if (!(ret = testcon_cli(fd))) {
-						/*ENTER RECONNECT PROCESS*/
-						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
-						close(fd);
-						recon_cli(ptrcli);
-						break;
-					}
-					if (ret == 2){
-						ptrcli->cli.state = 2;
-						ptrntr->state=1;
-						/*connect success!*/
-						openntrip(ptrntr);
-					}
-					if (ret < 2)
-						break;
-				}
-				send_packet(ptrcli);
-			}
-		}
-	}
-	return 1;
-}
-
-int main(){
-	stream_t stream;
-	startntripcli(&stream,ntrrecv_callback,1);
-}
 
 
 
