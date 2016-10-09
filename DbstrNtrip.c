@@ -110,22 +110,32 @@ typedef struct {
 /*structure for ntrip caster & server*/
 typedef struct{
 	int type;  /*0:client 1:server*/
-	int state; /**/
-	char* ptrmount;
+	int state; /*0:unauthorized 1:authorized*/
+	char mountpoint[maxstrsize];
 	void* host;
-	tcpcli_list* cliHead;
+	tcpcli_t tcpcli;
 }ntrip_svr_unit;
+
+
+typedef struct{
+	struct list_head list;
+	void* host;
+	void* con_list;  /*clients for the mountpoint corresponding to the server*/
+	ntrip_svr_unit unit;
+}ntrip_svr_unit_list;
 
 typedef struct{
 	struct list_head list;
 	char mountpoint[maxstrsize];
-	ntrip_svr_unit* unit;
-}ntrip_svr_unit_list;
+	ntrip_svr_unit_list cli_list;
+}ntrip_svr_con_list;
 
 typedef struct{
-	ntrip_svr_unit_list* cliHead;
-	ntrip_svr_unit_list* svrHead;
+	ntrip_svr_con_list cliHead;
 
+
+	ntrip_svr_unit_list svrHead;  /*list queue for server */
+	ntrip_svr_unit_list halfHead; /*list queue for connected client*/
 
 	void* host;
 	tcp_t svr;
@@ -309,8 +319,9 @@ static int connect_nb(tcp_t* tcp) {
 static int send_packet(tcpcli_t *cli) {
 	lock(&(cli->synccli));
 	packet_list* pos = NULL;
-	int nsend, nrem, sumsd;
+	int nsend, nrem, sumsd,bempty;
 	char buff[payloadsize];
+
 	while (!list_empty(&cli->sndpkt.list)) {
 		pos = list_entry(cli->sndpkt.list.next, typeof(*pos), list);
 		nrem = pos->n;
@@ -345,8 +356,11 @@ static int send_packet(tcpcli_t *cli) {
 		//should open
 		cli->snredy = 1;
 		/*change epoll model mode*/
+
 	}
 	unlock(&(cli->synccli));
+
+	return cli->snredy;
 }
 
 
@@ -388,6 +402,7 @@ static int send_nb(tcpcli_t* cli, char* buff, int len) {
 				list_add_tail(&payload->list, &cli->sndpkt.list);
 			}
 			cli->snredy = 0;
+
 		}
 	} else {
 		/*add the buffer packet */
@@ -401,8 +416,9 @@ static int send_nb(tcpcli_t* cli, char* buff, int len) {
 			list_add_tail(&payload->list, &cli->sndpkt.list);
 		}
 	}
+
 	unlock(&(cli->synccli));
-	return 1;
+	return cli->snredy;
 }
 
 
@@ -701,9 +717,63 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 	}
 	return 1;
 }
+/**************************************NTRIP-CASTER******************************************************/
+static int accept_nb(ntrip_caster_t* ptrcas) {
+	struct sockaddr_in addr;
+	struct epoll_event ev;
+	socklen_t len = sizeof(struct sockaddr);
+	stream_t *stream=(stream_t*)ptrcas->host;
+	/*if it is ET mode ,here should be a loop*/
+	while (1) {
+		int fd = accept(ptrcas->svr.sock, (struct sockaddr*) &addr, &len);
+		if (fd == -1 && errno == EWOULDBLOCK)
+			break;
+		if (!setsock(fd)){
+			/*can't set no-block */
+			close(fd);
+			continue;
+		}
+		/***************add client information**************************/
+
+		ntrip_svr_unit *ptrunit=(ntrip_svr_unit*)malloc(sizeof(ntrip_svr_unit));
+		tcpcli_t* cli=&ptrunit->tcpcli;
+		ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
+		ev.data.ptr = (void*)ptrunit;
+		if (epoll_ctl(stream->efd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+			perror("epoll_ctl failed! server break down!\n");
+			exit(1);
+		}
+		/******************fill the tcpcli information******************/
+		cli->snredy = 1;
+		initlock(&(cli->synccli));
+		cli->reconinv = 0;
+		cli->inactinv = 1000 * 7200; /*two hour for inactive socket*/
+		list_init(&cli->sndpkt.list);
+
+		/*update socket configure*/
+		cli->cli.sock = fd;
+		cli->cli.state = 2;
+
+		cli->cli.tact = tickget();
+		memcpy(&(cli->cli.addr), &addr, sizeof(addr));
+		strcpy(cli->cli.saddr, inet_ntoa(addr.sin_addr));
+		/***************************************************************/
+
+		ptrunit->state=0;
 
 
+		ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*)malloc(sizeof(ntrip_svr_unit_list));
+		ptrunitlist->unit=ptrunit;
 
+		/*update the unit_list host*/
+		ptrunitlist->host=(void*)&ptrcas->halfHead;
+		ptrunit->host=(void*)ptrunitlist;
+		/*********************add to the ntrip_cast_t queue******************/
+		list_add_tail(&ptrunitlist->list,&(ptrcas->halfHead.list));
+
+	}
+	return 1;
+}
 static ntrip_caster_t* openntripsvr(opt_t* opt){
 
 	ntrip_caster_t *ntrsvr,ntrsvr0={{0}};
@@ -717,16 +787,79 @@ static ntrip_caster_t* openntripsvr(opt_t* opt){
 		ntrsvr=NULL;
 		return NULL;
 	}
-
-	list_init(&ntrsvr->cliHead->list);
-	list_init(&ntrsvr->svrHead->list);
-
+	/*initial connected client list*/
+	list_init(&ntrsvr->cliHead.list);
+	list_init(&ntrsvr->svrHead.list);
+	list_init(&ntrsvr->halfHead.list);
 
 }
+static void handle_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas){
+	char buffer[maxstrsize];
+	int nread;
+	while(1){
+		nread = recv(ptrunit->tcpcli.cli.sock, buffer, sizeof(buffer), 0);
+		if (nread < 0
+				&& ( errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN)) {
+			break;
+		} else if (nread <= 0) {
+			ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*)ptrunit.host;
+			list_del(&ptrunitlist->list);
+			free(ptrunit);
+			free(ptrunitlist);
+			ptrunit=NULL;
+			break;
+		}
+		if(!(parse_request(ptrunit))){
+			/*	 failed to authorized	*/
+			if(send_nb()){
+				/*remove from the half-connected list*/
+				ntrip_svr_unit_list* ptrunitlist =
+						(ntrip_svr_unit_list*) ptrunit->host;
+				list_del(&ptrunitlist->list);
+				/*close the client*/
+				close(ptrunit->tcpcli.cli.sock);
 
-
-
-
+				free(ptrunit);
+				free(ptrunitlist);
+			}
+		}
+	}
+}
+static void handle_source(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas){
+	char buffer[maxstrsize];
+	int nread;
+	ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*)ptrunit.host;
+	while(1){
+		nread = recv(ptrunit->tcpcli.cli.sock, buffer, sizeof(buffer), 0);
+		if (nread < 0
+				&& ( errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN)) {
+			break;
+		} else if (nread <= 0) {
+			switch(ptrunit->type){
+			/*client closed*/
+			case 0:
+				list_del(&ptrunitlist->list);
+				free(ptrunit);
+				free(ptrunitlist);
+				ptrunit=NULL;
+				break;
+			/*server closed*/
+			case 1:
+				ntrip_svr_con_list* ptrconlist = (ntrip_svr_con_list*)ptrunitlist->con_list;
+				svr_close_conlist(ptrconlist);
+				free(ptrconlist);
+				list_del(&ptrunitlist->list);
+				free(ptrunit);
+				free(ptrunitlist);
+				ptrunit=NULL;
+				break;
+			}
+			break;
+		}
+		ntrip_svr_con_list* ptrconlist=(ntrip_svr_con_list*)ptrunitlist->con_list;
+		send_cli(ptrconlist);
+	}
+}
 static void startntripsvr(stream_t* stream){
 
 	ntrip_caster_t* ntrsvr;
@@ -747,35 +880,39 @@ static void startntripsvr(stream_t* stream){
 	ntrsvr->host=(void*)stream;
 
 	ev.events = EPOLLIN | EPOLLET;
-	ev.data.fd = ntrsvr->svr.sock;
-
-	epoll_ctl(stream.efd, EPOLL_CTL_ADD, ntrsvr->svr.sock, &ev);
-
-
-
-
-
-
-
-
-
-
+	ev.data.fd=ntrsvr->svr.sock;
+	epoll_ctl(stream->efd, EPOLL_CTL_ADD, ntrsvr->svr.sock, &ev);
+	while(1){
+		nfd = epoll_wait(stream->efd, events, MAXEPOLL, 1000*1000);
+		for(i=0;i<nfd;i++){
+			if(events[i].data.fd==ntrsvr->svr.sock&&(events[i].events&EPOLLIN)){
+					accept_nb(ntrsvr);
+			}else if(events[i].events&EPOLLIN){
+				ntrip_svr_unit* ptrunit = (ntrip_svr_unit*)events[i].data.ptr;
+				switch(ptrunit->state){
+				/*client or server request*/
+				case 0:
+					handle_request(ptrunit,ntrsvr);
+					break;
+				/*server source stream*/
+				case 1:
+					handle_source(ptrunit,ntrsvr);
+					break;
+				}
+			}else if(events[i].events&EPOLLOUT){
+				ntrip_svr_unit* ptrunit = (ntrip_svr_unit*)events[i].data.ptr;
+				if(send_packet(&ptrunit->tcpcli)){
+					if(ptrunit->state==0){
+						ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*)ptrunit->host;
+						list_del(&ptrunitlist->list);
+						/*close the client*/
+						close(ptrunit->tcpcli.cli.sock);
+						free(ptrunit);
+						free(ptrunitlist);
+					}
+				}
+			}
+		}
+		/*clear the timeout clients*/
+	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
