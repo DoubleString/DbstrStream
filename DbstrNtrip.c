@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include "list.h"
+#include "DbstrNtrip.h"
 
 #define socket_t int
 #define epoll_t int
@@ -237,6 +238,7 @@ int run_tim() {
 }
 
 
+
 static int setsock(socket_t sock) {
 	int opts;
 	if ((opts = fcntl(sock, F_GETFL)) < 0) {
@@ -346,10 +348,11 @@ static int connect_nb(tcp_t* tcp) {
 static int send_packet(tcpcli_t *cli) {
 	lock(&(cli->synccli));
 	packet_list* pos = NULL;
-	int nsend, nrem, sumsd,bempty;
+	int nsend, nrem, sumsd;
 	char buff[payloadsize];
 
 	while (!list_empty(&cli->sndpkt.list)) {
+		printf("enter send packet!\n");
 		pos = list_entry(cli->sndpkt.list.next, typeof(*pos), list);
 		nrem = pos->n;
 		sumsd = 0;
@@ -526,9 +529,11 @@ static int recon_cli(tcpcli_t* cli) {
 }
 static void ntrrecv_callback(char* buffer,int n,void* arg){
 	ntrip_cli_t* ptrntr = (ntrip_cli_t*) arg;
-	static char* mout[10]={0};
-	static FILE* fp[10]={NULL};
-	static int id[10],i;
+#define maxcli 100
+
+	static int fd[maxcli]={0};
+	static FILE* fp[maxcli]={NULL};
+	static int id[maxcli],i;
 	if(ptrntr->state<=0)
 		return;
 	if(ptrntr->state==1){
@@ -544,13 +549,13 @@ static void ntrrecv_callback(char* buffer,int n,void* arg){
 		}
 		return;
 	}
-	for(i=0;i<10;i++){
-		if(mout[i]==NULL||strstr(mout[i],ptrntr->mountpoint)){
+	for(i=0;i<maxcli;i++){
+		if(fd[i]==0||fd[i]==ptrntr->cli->cli.sock){
 			break;
 		}
 	}
-	if(mout[i]==NULL){
-		mout[i]=ptrntr->mountpoint;
+	if(fd[i]==0){
+		fd[i]=ptrntr->cli->cli.sock;
 	}
 
 	int iday=run_tim();
@@ -558,7 +563,7 @@ static void ntrrecv_callback(char* buffer,int n,void* arg){
 	if (id[i] != iday) {
 		if(fp[i])
 			fclose(fp[i]);
-		sprintf(buff,"savfile_%s_%d",ptrntr->mountpoint,iday);
+		sprintf(buff,"savfile_%s_%d",ptrntr->mountpoint,ptrntr->cli->cli.sock);
 		if(!(fp[i]=fopen(buff,"w"))){
 			printf("cant open file to write :%s \n",buff);
 			exit(1);
@@ -591,7 +596,7 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 	/******************************************************************************************/
 	lock(&stream->synlock); /*lock because reconnect thread may change the stream.prot.cliHead*/
 	for (i = 0; i < ncli; i++) {
-		if (!(cli = opentcpcli("127.0.0.1",2101))) {
+		if (!(cli = opentcpcli("59.172.4.52",7005))) {
 			printf("failed to opencli!\n");
 			continue;
 		}
@@ -605,30 +610,36 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 		ntrlist->ntrcli=ptrntr0;
 
 		/*********************************************add ntrip configure for test********************************************************/
-		switch(i){
-		case 0:
-			strcpy(ntrlist->ntrcli.mountpoint,"TJ01");
-			strcpy(ntrlist->ntrcli.usr,"dd");
-			strcpy(ntrlist->ntrcli.psd,"111111");
-			strcpy(cli->cli.saddr,"127.0.0.1");
-			cli->cli.port=2101;
-		break;
-		case 1:
-			strcpy(ntrlist->ntrcli.mountpoint,"QLZ2");
-			strcpy(ntrlist->ntrcli.usr,"dd");
-			strcpy(ntrlist->ntrcli.psd,"111111");
-			strcpy(cli->cli.saddr,"59.175.223.165");
-			cli->cli.port=2101;
+//		switch(i){
+//		case 0:
+//			strcpy(ntrlist->ntrcli.mountpoint,"TJ01");
+//			strcpy(ntrlist->ntrcli.usr,"dd");
+//			strcpy(ntrlist->ntrcli.psd,"111111");
+//			strcpy(cli->cli.saddr,"127.0.0.1");
+//			cli->cli.port=2101;
+//		break;
+//		case 1:
+//			strcpy(ntrlist->ntrcli.mountpoint,"QLZ2");
+//			strcpy(ntrlist->ntrcli.usr,"dd");
+//			strcpy(ntrlist->ntrcli.psd,"111111");
+//			strcpy(cli->cli.saddr,"59.175.223.165");
+//			cli->cli.port=2101;
+//
+//			break;
+//		case 2:
+//			strcpy(ntrlist->ntrcli.mountpoint,"ION1");
+//			strcpy(ntrlist->ntrcli.usr,"dd");
+//			strcpy(ntrlist->ntrcli.psd,"111111");
+//			strcpy(cli->cli.saddr,"59.175.223.165");
+//			cli->cli.port=2101;
+//			break;
+//		}
 
-			break;
-		case 2:
-			strcpy(ntrlist->ntrcli.mountpoint,"ION1");
-			strcpy(ntrlist->ntrcli.usr,"dd");
-			strcpy(ntrlist->ntrcli.psd,"111111");
-			strcpy(cli->cli.saddr,"59.175.223.165");
-			cli->cli.port=2101;
-			break;
-		}
+		strcpy(ntrlist->ntrcli.mountpoint,"TJ03");
+		strcpy(ntrlist->ntrcli.usr,"dd");
+		strcpy(ntrlist->ntrcli.psd,"111111");
+		strcpy(cli->cli.saddr,"59.172.4.52");
+		cli->cli.port=7005;
 		/******************************************************************************************************************************/
 		ntrlist->ntrcli.cli=cli;
 		ntrlist->ntrcli.host=(void*)stream;
@@ -816,8 +827,8 @@ static ntrip_caster_t* openntripsvr(opt_t* opt){
 	}
 
 	*ntrsvr=ntrsvr0;
-	strcpy(ntrsvr->svr.saddr,"127.0.0.1");
-	ntrsvr->svr.port=2101;
+	strcpy(ntrsvr->svr.saddr,"59.172.4.52");
+	ntrsvr->svr.port=7005;
 	if(!gentcp(&ntrsvr->svr,0)){
 		free(ntrsvr);
 		ntrsvr=NULL;
@@ -842,22 +853,72 @@ static ntrip_svr_con_list* get_conlist(ntrip_caster_t* ptrcas,char* mount){
 }
 
 static void gen_sourcetable(ntrip_caster_t* ptrcas,char* buffer){
-
-
-
-
+	ntrip_svr_unit_list* ptrsvr,*ptrsvrpos;
+	char mout[1024],msg[1024];
+	ptrsvr = &ptrcas->svrHead;
+	strcpy(msg,"SOURCETABLE 200 OK\r\n"
+			"Content-Type: text/plain\r\n"
+			"Content-Length: %d\r\n");
+	int len=0;
+	list_for_each_entry(ptrsvrpos,&ptrsvr->list,list){
+		sprintf(mout,"STR;%s;;RTCM3; ; ; ; ; ; ; ; ; ; ; ; ; ; ; \r\n",((ntrip_svr_con_list*)ptrsvrpos->con_list)->mountpoint);
+		len+=strlen(mout);
+		strcat(msg,mout);
+	}
+	strcat(msg,"ENDSOURCETABLE\r\n");
+	len+=strlen("ENDSOURCETABLE\r\n");
+	sprintf(buffer,msg,len);
 }
 static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* buffer,int n,char* replymsg){
 	int ret=0;
-	char mountpoint[maxstrsize];
-	char authpsd[maxstrsize];
+	char mountpoint[maxstrsize]={0};
+	char authpsd[maxstrsize]={0};
+	char msg[maxstrsize*2]={0};
 	ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*)ptrunit->host;
-	ntrip_svr_con_list* conlist;
+	ntrip_svr_con_list* conlist=NULL;
 	/*update the handle tag*/
 	ptrunit->bhandle=1;
-	if(strstr(buffer,"GET")){
+
+	char* ptrcliReq=NULL,*ptrReq=NULL;
+	char* ptrsvrReq=NULL;
+
+	/*Compatible to other forms of request*/
+	strncpy(msg,buffer,n);
+	ptrReq = lower_string(msg);
+	ptrcliReq=strstr(ptrReq,"get");
+	ptrsvrReq=strstr(ptrReq,"source");
+	int index=-1;
+
+	if(ptrcliReq){
+		index=index_string(ptrReq,*ptrcliReq);
+		if(index!=0){
+			strcpy(replymsg,"401 Unauthorized");
+			return 0;
+		}
+		while(buffer[index]!=' '){
+			if (buffer[index] >= 'A' && buffer[index] <= 'Z')
+				buffer[index] += 32;
+			index++;
+		}
+	}else if(ptrsvrReq){
+		index=index_string(ptrReq,*ptrsvrReq);
+		if(index!=0){
+			strcpy(replymsg,"401 Unauthorized");
+			return 0;
+		}
+		while(buffer[index]!=' '){
+			if (buffer[index] >= 'A' && buffer[index] <= 'Z')
+				buffer[index] += 32;
+			index++;
+		}
+	}
+
+
+	if(ptrcliReq){
 		/*client part*/
-		sscanf(strstr(buffer,"GET"),"%*s%s",mountpoint);
+		sscanf(strstr(buffer,"get"),"%*s%s",mountpoint);
+
+
 		/*remove the /*/
 		if(mountpoint[0]=='/'){
 			char* ptr =mountpoint;
@@ -868,15 +929,9 @@ static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* bu
 		}
 		printf("ntrip client request mountpoint:%s\n",mountpoint);
 		if(!strstr(buffer,"Authorization: Basic")){
-			sprintf(replymsg,"Server: NtripCaster/1.0\r\n"
-			     "WWW-Authenticate: Basic realm=\"/%s\"\r\n"
-			     "Content-Type: text/html\r\n"
-			     "Connection: close\r\n"
-			     "<html><head><title>401 Unauthorized</title></head><body bgcolor=black text=white\r\n"
-			                 "link=blue alink=red>\r\n"
-			     "<h1><center>The server does not recognize your privileges to the requested entity\r\n"
-			                 "stream</center></h1>\r\n"
-			     "</body></html>",mountpoint);
+			/*generate source table message*/
+			gen_sourcetable(ptrcas,replymsg);
+
 			return 0;
 		}else{
 			sscanf(strstr(buffer,"Authorization: Basic"),"%*s%s",authpsd);
@@ -897,8 +952,7 @@ static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* bu
 		}
 		conlist = get_conlist(ptrcas,mountpoint);
 		if(conlist==NULL){
-			sprintf(replymsg,"SOURCETABLE 200 OK ");
-
+			gen_sourcetable(ptrcas,replymsg);
 			return 0;
 		}
 		else{
@@ -917,9 +971,9 @@ static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* bu
 
 			return 1;
 		}
-	}else if(strstr(buffer,"SOURCE")){
+	}else if(ptrsvrReq){
 		char psd[256];
-		sscanf(strstr(buffer,"SOURCE"),"%*s%s%s",psd,mountpoint);
+		sscanf(strstr(buffer,"source"),"%*s%s%s",psd,mountpoint);
 		/*remove the /*/
 		if(mountpoint[0]=='/'){
 			char* ptr =mountpoint;
@@ -928,6 +982,12 @@ static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* bu
 				ptr++;
 			}
 		}
+		if(strlen(mountpoint)>100){
+			strcpy(replymsg,"401 Unauthorized : mountpoint size too long!\n");
+			return 0;
+		}
+		//check for mountpoint int the caster
+
 
 		printf("svr connected success! psd: %s mountpoint: %s \n",psd,mountpoint);
 
@@ -1030,6 +1090,12 @@ static int handle_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas){
 			ptrunit=NULL;
 			return 0;
 		}
+		if(nread<sizeof(buffer))
+			buffer[nread]='\0';
+
+		printf("the request msg is:\n");
+		printf("%s\n",buffer);
+
 		if(!(parse_request(ptrunit,ptrcas,buffer,nread,replymsg))){
 			/*	 failed to authorized	*/
 
@@ -1139,7 +1205,6 @@ static void startntripcaster(stream_t* stream){
 		for(i=0;i<nfd;i++){
 			if(events[i].data.fd==ntrsvr->svr.sock&&(events[i].events&EPOLLIN)){
 					accept_nb(ntrsvr);
-					//usleep(1000*10);
 			}else if(events[i].events&EPOLLIN){
 				ntrip_svr_unit* ptrunit = (ntrip_svr_unit*)events[i].data.ptr;
 				switch(ptrunit->state){
@@ -1183,6 +1248,8 @@ static void startntripsvr(stream_t* stream){
 
 }
 int main(int argc,char* args[]){
+
+
 	if(strstr(args[1],"caster")){
 		stream_t stream;
 		startntripcaster(&stream);

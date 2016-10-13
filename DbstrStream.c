@@ -605,11 +605,13 @@ static void recon_callback(void* arg) {
 		return;
 	}
 	do {
+		/*should be that?*/
+
 		if (ptrcli->reconinv != 0) {
 			usleep(ptrcli->reconinv * 1000);
 			printf("enter reconnect process\n");
 		} else
-			usleep(100 * 1000);
+			usleep(10000 * 1000);
 	} while (!connect_nb(&ptrcli->cli));
 	ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
 	ev.data.ptr = (void*) ptrcli;
@@ -637,7 +639,7 @@ static int shutdowntcp_cli(stream_t* stream) {
 
 }
 
-static void send_cli(stream_t *stream, char* buffer, int n) {
+void send_cli(stream_t *stream, char* buffer, int n) {
 	/*lock in case of free tcpcli*/
 	lock(&stream->synlock);
 	tcpcli_list *cliHead = stream->prot.cliHead;
@@ -651,7 +653,7 @@ static void send_cli(stream_t *stream, char* buffer, int n) {
 	unlock(&stream->synlock);
 }
 
-static int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
+int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
 	tcpcli_t *cli, *ptrcli;
 	int nfd, i, fd, nread, ret;
 	char buffer[payloadsize];
@@ -668,7 +670,7 @@ static int starttcpcli(stream_t *stream, dataRecvCallback callback, int ncli) {
 	/******************************************************************************************/
 	lock(&stream->synlock); /*lock because reconnect thread may change the stream.prot.cliHead*/
 	for (i = 0; i < ncli; i++) {
-		if (!(cli = opentcpcli("127.0.0.1",8002))) {
+		if (!(cli = opentcpcli("59.172.4.52",7005))) {
 			printf("failed to opencli!\n");
 			continue;
 		}
@@ -799,7 +801,7 @@ void pth_recv(void* arg) {
 	starttcpcli(stream, callback, ncli);
 }
 
-int ma_in(int argc, char *args[]) {
+int ntripsvr(int argc, char *args[]) {
 	pthread_t pth_t;
 	stream_t stream;
 	FILE *fp;
@@ -809,7 +811,12 @@ int ma_in(int argc, char *args[]) {
 		perror("cant create thread for cli!\n");
 		exit(1);
 	}
-	FILE* savfile = fopen("/home/doublestring/savfile", "w");
+	usleep(3000*1000);
+
+	strcpy(buffer,"Source letmein /TJ03 "
+		    "Source-Agent: NTRIP NtripServerCMD/1.0");
+	send_cli(&stream,buffer,strlen(buffer));
+
 	while (1) {
 		printf("Please input the filename:\n");
 		scanf("%s", buffer);
@@ -822,12 +829,10 @@ int ma_in(int argc, char *args[]) {
 		while (!feof(fp)) {
 			len = fread(buffer, sizeof(char), payloadsize * 5, fp);
 			send_cli(&stream, buffer, len);
-			fwrite(buffer, sizeof(char), len, savfile);
-			fflush(savfile);
 		}
 		fclose(fp);
 	}
-	fclose(savfile);
+
 }
 
 /*********************************************************************************************************************************************************/

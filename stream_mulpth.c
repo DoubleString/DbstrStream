@@ -23,8 +23,8 @@
 
 #define STREAM_TCP 1
 
-#define MODE_SVR (STREAM_TCP+1)
-#define MODE_CLI (MODE_SVR+1)
+#define MODE_TCPSVR (STREAM_TCP+1)
+#define MODE_TCPCLI (MODE_TCPSVR+1)
 
 #define payloadsize 1024
 
@@ -293,6 +293,10 @@ int loadFile(FILE** fp){
 	char buffer[payloadsize];
 	printf("Please input the FILENAME:\n");
 	scanf("%s", buffer);
+
+	if(strstr(buffer,"closestream")){
+		return 2;
+	}
 	if (!(*fp = fopen(buffer, "r"))) {
 		printf("cant open file %s to send!\n", buffer);
 		return 0;
@@ -311,7 +315,7 @@ int m_ain(int argc, char *args[]) {
 	tcpcli_list *recu,*tmp;
 	FILE *fp;
 	char buffer[payloadsize];
-	int len,sumsd,nsend,nrem,ncli;
+	int len,sumsd,nsend,nrem,ncli,ret;
 	if (-1 == pthread_create(&pth_main, NULL, start_up, &stream)) {
 		printf("cant create thread for main thread ! now exit!\n");
 		exit(1);
@@ -325,17 +329,27 @@ int m_ain(int argc, char *args[]) {
 	printf("continue to send buffer!\n");
 	tcpsvr_t *svr = (tcpsvr_t*)stream.prot;
 
+
 	while (1) {
-		if(!loadFile(&fp))
+		fp=NULL;
+		if(!(ret=loadFile(&fp)))
 			continue;
-		ncli;
-		while(!feof(fp)){
-			len=fread(buffer,sizeof(char),payloadsize,fp);
+		while(ret==2||!feof(fp)){
+			if(ret!=2){
+				len=fread(buffer,sizeof(char),payloadsize,fp);
+			}
 			cliHead= &svr->clients;
 			recu = list_entry(cliHead->list.next, typeof(*recu), list);
 			while (&recu->list != &cliHead->list) {
+
 				/*update closed socket*/
 				tmp = recu->client->cli.state == 0 ? recu : NULL;
+
+				if(ret==2&&tmp==NULL){
+					tmp=recu;
+					//close(tmp->client->cli.sock);
+					shutdown(tmp->client->cli.sock,2);
+				}
 
 				/*update timeout socket*/
 				if (tmp == NULL) {
@@ -361,9 +375,11 @@ int m_ain(int argc, char *args[]) {
 					tmp = NULL;
 				}
 			}
+			if(ret==2)
+				break;
 		}
-
-		fclose(fp);
+		if(fp)
+			fclose(fp);
 	}
 }
 
