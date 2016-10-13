@@ -892,7 +892,7 @@ static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* bu
 	if(ptrcliReq){
 		index=index_string(ptrReq,*ptrcliReq);
 		if(index!=0){
-			strcpy(replymsg,"401 Unauthorized");
+			strcpy(replymsg,"401 Unauthorized\r\n");
 			return 0;
 		}
 		while(buffer[index]!=' '){
@@ -903,7 +903,7 @@ static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* bu
 	}else if(ptrsvrReq){
 		index=index_string(ptrReq,*ptrsvrReq);
 		if(index!=0){
-			strcpy(replymsg,"401 Unauthorized");
+			strcpy(replymsg,"401 Unauthorized\r\n");
 			return 0;
 		}
 		while(buffer[index]!=' '){
@@ -966,7 +966,7 @@ static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* bu
 			ptrunitlist->host=(void*)&ptrcas->cliHead;
 
 			/*send to the client*/
-			sprintf(replymsg,"ICY 200 OK");
+			sprintf(replymsg,"ICY 200 OK\r\n");
 			send_nb(&ptrunit->tcpcli,replymsg,strlen(replymsg));
 
 			return 1;
@@ -983,7 +983,7 @@ static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* bu
 			}
 		}
 		if(strlen(mountpoint)>100){
-			strcpy(replymsg,"401 Unauthorized : mountpoint size too long!\n");
+			strcpy(replymsg,"401 Unauthorized\r\n : mountpoint size too long!\r\n");
 			return 0;
 		}
 		//check for mountpoint int the caster
@@ -1011,7 +1011,7 @@ static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* bu
 		ptrunit->type=1;
 
 		//remember to send the corresponding answer message to the server
-		sprintf(replymsg,"ICY 200 OK");
+		sprintf(replymsg,"ICY 200 OK\r\n");
 		send_nb(&ptrunit->tcpcli,replymsg,strlen(replymsg));
 		return 1;
 	}
