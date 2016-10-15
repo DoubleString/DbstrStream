@@ -16,6 +16,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <string.h>
+#include <signal.h>
 #include "list.h"
 #include "DbstrNtrip.h"
 
@@ -45,10 +46,9 @@
 #endif
 static int ticonnect = 10000;
 
-static char ICY_OK[]="ICY 200 OK";
-static char ICY_UN[]="Unauthorized";
-static char ICY_SOURCE[]="SOURCETABLE";
-
+static char ICY_OK[] = "ICY 200 OK";
+static char ICY_UN[] = "Unauthorized";
+static char ICY_SOURCE[] = "SOURCETABLE";
 
 #define MAXEPOLL 1024
 typedef void (*dataRecvCallback)(char *buff, int n, void* arg);
@@ -106,48 +106,42 @@ typedef struct {
 	ntrip_cli_t ntrcli;
 } ntrip_cli_list;
 
-
-
-
 /*structure for ntrip caster & server*/
-typedef struct{
-	int type;  /*0:client 1:server*/
+typedef struct {
+	int type; /*0:client 1:server*/
 	int state; /*0:unauthorized 1:authorized*/
 	char mountpoint[maxstrsize];
 	void* host;
 	tcpcli_t tcpcli;
 	int bhandle;
-}ntrip_svr_unit;
+} ntrip_svr_unit;
 
-
-typedef struct{
+typedef struct {
 	struct list_head list;
 	void* host;
-	void* con_list;  /*clients for the mountpoint corresponding to the server*/
+	void* con_list; /*clients for the mountpoint corresponding to the server*/
 	ntrip_svr_unit *unit;
-}ntrip_svr_unit_list;
+} ntrip_svr_unit_list;
 
-typedef struct{
+typedef struct {
 	struct list_head list;
 	char mountpoint[maxstrsize];
 	ntrip_svr_unit_list cli_list;
-}ntrip_svr_con_list;
+} ntrip_svr_con_list;
 
-typedef struct{
+typedef struct {
 	ntrip_svr_con_list cliHead;
 
-
-	ntrip_svr_unit_list svrHead;  /*list queue for server */
+	ntrip_svr_unit_list svrHead; /*list queue for server */
 	ntrip_svr_unit_list halfHead; /*list queue for connected client*/
 
 	void* host;
 	tcp_t svr;
-}ntrip_caster_t;
+} ntrip_caster_t;
 
-typedef struct{
+typedef struct {
 
-}opt_t;
-
+} opt_t;
 
 typedef struct {
 	int type;
@@ -168,7 +162,6 @@ static int errsock(void) {
 	return errno;
 }
 #endif
-
 
 /**************************************************************MULTI-NTRIP-CLIENT*************************************************************************/
 int modified_julday(int iyear, int imonth, int iday) {
@@ -215,29 +208,26 @@ int run_tim() {
 	struct tm *ptr;
 	time_t rawtime;
 	time(&rawtime);
-	ptr=gmtime(&rawtime);
+	ptr = gmtime(&rawtime);
 
-	int iyear,idoy;
+	int iyear, idoy;
 
+	int mjdgps, mjdtai;
+	double sodgps, sodtai;
 
-	int mjdgps,mjdtai;
-	double sodgps,sodtai;
+	int mjd = modified_julday(ptr->tm_year + 1900, ptr->tm_mon + 1,
+			ptr->tm_mday);
 
-	int mjd=modified_julday(ptr->tm_year+1900,ptr->tm_mon+1,ptr->tm_mday);
+	double sod = 3600 * ptr->tm_hour + 60 * ptr->tm_min + ptr->tm_sec;
 
-	double sod=3600*ptr->tm_hour+60*ptr->tm_min+ptr->tm_sec;
+	timinc(mjd, sod, 36, &mjdtai, &sodtai);
 
+	timinc(mjdtai, sodtai, 19 * -1, &mjdgps, &sodgps);
 
-	timinc(mjd,sod,36,&mjdtai,&sodtai);
-
-	timinc(mjdtai,sodtai,19*-1,&mjdgps,&sodgps);
-
-	mjd2doy(mjdgps,&iyear,&idoy);
+	mjd2doy(mjdgps, &iyear, &idoy);
 
 	return idoy;
 }
-
-
 
 static int setsock(socket_t sock) {
 	int opts;
@@ -300,15 +290,15 @@ static int gentcp(tcp_t *tcp, int type) {
 	return 1;
 }
 
-static tcpcli_t* opentcpcli(char *addr,int port) {
+static tcpcli_t* opentcpcli(char *addr, int port) {
 	tcpcli_t* tcpcli, tcpcli0 = { { 0 } };
 	if (!(tcpcli = (tcpcli_t*) malloc(sizeof(tcpcli_t)))) {
 		printf("malloc error!\n");
 		return NULL;
 	}
 	*tcpcli = tcpcli0;
-	strcpy(tcpcli->cli.saddr,addr);
-	tcpcli->cli.port=port;
+	strcpy(tcpcli->cli.saddr, addr);
+	tcpcli->cli.port = port;
 	if (!gentcp(&tcpcli->cli, 1)) {
 		free(tcpcli);
 		tcpcli = NULL;
@@ -368,6 +358,8 @@ static int send_packet(tcpcli_t *cli) {
 				memcpy(pos->buff, buff + sumsd, nrem);
 				pos->n = nrem;
 				break;
+			}else if(nsend<=0){
+				return -1;
 			}
 			sumsd += nsend;
 			nrem -= sumsd;
@@ -393,7 +385,6 @@ static int send_packet(tcpcli_t *cli) {
 	return cli->snredy;
 }
 
-
 /*to get the tcpcli_t,should lock the svr.syncsvr and loop the linked list.
  so the bug of when the client memory is freed,the following code wouldn't cause
  segmentation fault********************************************************/
@@ -414,6 +405,9 @@ static int send_nb(tcpcli_t* cli, char* buff, int len) {
 							|| errno == EINTR)) {
 				/*write buffer is full*/
 				break;
+			}else if(nsend<=0){
+				/*the connect is shut down*/
+				return -1;
 			}
 			sumsd += nsend;
 			nrem -= sumsd;
@@ -468,27 +462,28 @@ static int testcon_cli(socket_t fd) {
 	return 2;
 }
 
-static void openntrip(ntrip_cli_t* ptrntr){
-	char cmd[maxstrsize],*base64,req[maxstrsize];
-	sprintf(cmd,"%s:%s",ptrntr->usr,ptrntr->psd);
-	base64=base64_encode(cmd,strlen(cmd));
-	sprintf(req,"GET /%s HTTP/1.0\r\nUser-Agent: NTRIP GNSSInternetRadio/1.2.0\r\nAuthorization: Basic %s\r\n\r\n",
-			ptrntr->mountpoint,base64);
-	send_nb(ptrntr->cli,req,strlen(req));
+static void openntrip(ntrip_cli_t* ptrntr) {
+	char cmd[maxstrsize], *base64, req[maxstrsize];
+	sprintf(cmd, "%s:%s", ptrntr->usr, ptrntr->psd);
+	base64 = base64_encode(cmd, strlen(cmd));
+	sprintf(req,
+			"GET /%s HTTP/1.0\r\nUser-Agent: NTRIP GNSSInternetRadio/1.2.0\r\nAuthorization: Basic %s\r\n\r\n",
+			ptrntr->mountpoint, base64);
+	send_nb(ptrntr->cli, req, strlen(req));
 }
 void recon_callback(void* arg) {
 	tcpcli_t* ptrcli = (tcpcli_t*) arg;
 
 	ntrip_cli_t* ntrcli = (ntrip_cli_t*) ptrcli->host;
-	stream_t* stream=ntrcli->host;
+	stream_t* stream = ntrcli->host;
 
 	struct epoll_event ev;
 	if (!gentcp(&ptrcli->cli, 1)) {
 		/*disconnect cli*/
 		printf("disconnect client %d!\n", ptrcli->cli.sock);
-		ntrcli->state=0;
-		ptrcli->cli.state=0;
-		ptrcli->pth_recon=-1;
+		ntrcli->state = 0;
+		ptrcli->cli.state = 0;
+		ptrcli->pth_recon = -1;
 		return;
 	}
 	do {
@@ -497,14 +492,14 @@ void recon_callback(void* arg) {
 			printf("enter reconnect process\n");
 		} else
 			usleep(100 * 1000);
-	} while (!(ntrcli->state=connect_nb(&ptrcli->cli)));
+	} while (!(ntrcli->state = connect_nb(&ptrcli->cli)));
 	ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
 
 	ev.data.ptr = (void*) ptrcli;
 
 	epoll_ctl(stream->efd, EPOLL_CTL_ADD, ptrcli->cli.sock, &ev);
 	/*in case of connecting immediately*/
-	if(ntrcli->state==2){
+	if (ntrcli->state == 2) {
 		openntrip(ntrcli);
 	}
 	ptrcli->pth_recon = -1;
@@ -520,28 +515,27 @@ static int recon_cli(tcpcli_t* cli) {
 			printf("thread for reconnect failed!\n");
 			cli->pth_recon = -1;
 			cli->cli.state = 0;
-			((ntrip_cli_t*)cli->host)->state=0;
+			((ntrip_cli_t*) cli->host)->state = 0;
 			/*create thread failed remove the client*/
 //			discont_cli((stream_t*)((ntrip_t*) cli->host)->host, cli);
 			return 0;
 		}
 	}
 }
-static void ntrrecv_callback(char* buffer,int n,void* arg){
+static void ntrrecv_callback(char* buffer, int n, void* arg) {
 	ntrip_cli_t* ptrntr = (ntrip_cli_t*) arg;
 #define maxcli 100
 
-	static int fd[maxcli]={0};
-	static FILE* fp[maxcli]={NULL};
-	static int id[maxcli],i;
-	if(ptrntr->state<=0)
+	static int fd[maxcli] = { 0 };
+	static FILE* fp[maxcli] = { NULL };
+	static int id[maxcli], i;
+	if (ptrntr->state <= 0)
 		return;
-	if(ptrntr->state==1){
-		if (strstr(buffer, ICY_OK) != NULL){
+	if (ptrntr->state == 1) {
+		if (strstr(buffer, ICY_OK) != NULL) {
 			printf("ICY 200 OK!\n");
-			ptrntr->state=2;
-		}
-		else if (strstr(buffer, ICY_UN) != NULL) {
+			ptrntr->state = 2;
+		} else if (strstr(buffer, ICY_UN) != NULL) {
 			printf("登录信息错误,请检查用户名,密码,挂载点是否输入正确!\n");
 
 		} else if (strstr(buffer, ICY_SOURCE) != NULL) {
@@ -549,37 +543,38 @@ static void ntrrecv_callback(char* buffer,int n,void* arg){
 		}
 		return;
 	}
-	for(i=0;i<maxcli;i++){
-		if(fd[i]==0||fd[i]==ptrntr->cli->cli.sock){
+	for (i = 0; i < maxcli; i++) {
+		if (fd[i] == 0 || fd[i] == ptrntr->cli->cli.sock) {
 			break;
 		}
 	}
-	if(fd[i]==0){
-		fd[i]=ptrntr->cli->cli.sock;
+	if (fd[i] == 0) {
+		fd[i] = ptrntr->cli->cli.sock;
 	}
 
-	int iday=run_tim();
+	int iday = run_tim();
 	char buff[1024];
 	if (id[i] != iday) {
-		if(fp[i])
+		if (fp[i])
 			fclose(fp[i]);
-		sprintf(buff,"savfile_%s_%d",ptrntr->mountpoint,ptrntr->cli->cli.sock);
-		if(!(fp[i]=fopen(buff,"w"))){
-			printf("cant open file to write :%s \n",buff);
+		sprintf(buff, "savfile_%s_%d", ptrntr->mountpoint,
+				ptrntr->cli->cli.sock);
+		if (!(fp[i] = fopen(buff, "w"))) {
+			printf("cant open file to write :%s \n", buff);
 			exit(1);
 		}
-		id[i]=iday;
+		id[i] = iday;
 	}
 
-	fwrite(buffer,sizeof(char),n,fp[i]);
+	fwrite(buffer, sizeof(char), n, fp[i]);
 	fflush(fp[i]);
 }
 
 /*********************************************************NTRIP CLIENT*************************************************************************************/
 
 static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) {
-	tcpcli_t *cli,*ptrcli;
-	ntrip_cli_t *ptrntr,ptrntr0={{0}};
+	tcpcli_t *cli, *ptrcli;
+	ntrip_cli_t *ptrntr, ptrntr0 = { { 0 } };
 	int nfd, i, fd, nread, ret;
 	char buffer[payloadsize];
 	struct epoll_event events[MAXEPOLL], ev;
@@ -588,7 +583,7 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 	stream->type = STREAM_TCP;
 	stream->efd = epoll_create(MAXEPOLL);
 
-	stream->prot.ntrHead=(ntrip_cli_list*)malloc(sizeof(ntrip_cli_list));
+	stream->prot.ntrHead = (ntrip_cli_list*) malloc(sizeof(ntrip_cli_list));
 	list_init(&stream->prot.ntrHead->list);
 	initlock(&stream->synlock);
 	/*********************************READ-CONFIG-FILE*****************************************/
@@ -596,7 +591,7 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 	/******************************************************************************************/
 	lock(&stream->synlock); /*lock because reconnect thread may change the stream.prot.cliHead*/
 	for (i = 0; i < ncli; i++) {
-		if (!(cli = opentcpcli("59.172.4.52",7005))) {
+		if (!(cli = opentcpcli("59.172.4.52", 7005))) {
 			printf("failed to opencli!\n");
 			continue;
 		}
@@ -606,8 +601,9 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 			cli->callback = callback;
 
 		/*add to the stream*/
-		ntrip_cli_list* ntrlist = (ntrip_cli_list*)malloc(sizeof(ntrip_cli_list));
-		ntrlist->ntrcli=ptrntr0;
+		ntrip_cli_list* ntrlist = (ntrip_cli_list*) malloc(
+				sizeof(ntrip_cli_list));
+		ntrlist->ntrcli = ptrntr0;
 
 		/*********************************************add ntrip configure for test********************************************************/
 //		switch(i){
@@ -634,29 +630,28 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 //			cli->cli.port=2101;
 //			break;
 //		}
-
-		strcpy(ntrlist->ntrcli.mountpoint,"TJ03");
-		strcpy(ntrlist->ntrcli.usr,"dd");
-		strcpy(ntrlist->ntrcli.psd,"111111");
-		strcpy(cli->cli.saddr,"59.172.4.52");
-		cli->cli.port=7005;
+		strcpy(ntrlist->ntrcli.mountpoint, "TJ03");
+		strcpy(ntrlist->ntrcli.usr, "dd");
+		strcpy(ntrlist->ntrcli.psd, "111111");
+		strcpy(cli->cli.saddr, "59.172.4.52");
+		cli->cli.port = 7005;
 		/******************************************************************************************************************************/
-		ntrlist->ntrcli.cli=cli;
-		ntrlist->ntrcli.host=(void*)stream;
-		list_add_tail(&ntrlist->list,&stream->prot.ntrHead->list);
-		cli->host = (void*)&ntrlist->ntrcli;
+		ntrlist->ntrcli.cli = cli;
+		ntrlist->ntrcli.host = (void*) stream;
+		list_add_tail(&ntrlist->list, &stream->prot.ntrHead->list);
+		cli->host = (void*) &ntrlist->ntrcli;
 		ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-		ev.data.ptr = (void*)cli;
+		ev.data.ptr = (void*) cli;
 		epoll_ctl(stream->efd, EPOLL_CTL_ADD, cli->cli.sock, &ev);
 
-		if (!(ntrlist->ntrcli.state=connect_nb(&cli->cli))) {
+		if (!(ntrlist->ntrcli.state = connect_nb(&cli->cli))) {
 			printf("sock %d connect failed! now trying to reconnect!\n",
 					cli->cli.sock);
 			epoll_ctl(stream->efd, EPOLL_CTL_DEL, cli->cli.sock, NULL);
 			recon_cli(cli);
 			continue;
 		}
-		if(ntrlist->ntrcli.state==2){
+		if (ntrlist->ntrcli.state == 2) {
 			openntrip(&ntrlist->ntrcli);
 		}
 	}
@@ -664,9 +659,9 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 	while (1) {
 		nfd = epoll_wait(stream->efd, events, MAXEPOLL, -1); /*infinite wait until it is ready*/
 		for (i = 0; i < nfd; i++) {
-			ptrcli = (tcpcli_t*)events[i].data.ptr;
+			ptrcli = (tcpcli_t*) events[i].data.ptr;
 
-			ptrntr=(ntrip_cli_t*)ptrcli->host;
+			ptrntr = (ntrip_cli_t*) ptrcli->host;
 
 			fd = ptrcli->cli.sock;
 			if (events[i].events & EPOLLERR) {
@@ -678,9 +673,9 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 						recon_cli(ptrcli);
 						break;
 					}
-					if (ret == 2){
+					if (ret == 2) {
 						ptrcli->cli.state = 2;
-						ptrntr->state=1;
+						ptrntr->state = 1;
 						/*open ntrip config*/
 						openntrip(ptrntr);
 					}
@@ -697,9 +692,9 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 						recon_cli(ptrcli);
 						break;
 					}
-					if (ret == 2){
+					if (ret == 2) {
 						ptrcli->cli.state = 2;
-						ptrntr->state=1;
+						ptrntr->state = 1;
 						/*open ntrip config*/
 						openntrip(ptrntr);
 					}
@@ -717,12 +712,12 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 						epoll_ctl(stream->efd, EPOLL_CTL_DEL, fd, NULL);
 						close(fd);
 						ptrcli->cli.state = 0;
-						ptrntr->state=0;
+						ptrntr->state = 0;
 						recon_cli(ptrcli);
 						break;
 					}
 					if (ptrcli->callback != NULL) {
-						ptrcli->callback(buffer, nread, (void*)ptrntr);
+						ptrcli->callback(buffer, nread, (void*) ptrntr);
 					}
 				}
 			}
@@ -735,9 +730,9 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 						recon_cli(ptrcli);
 						break;
 					}
-					if (ret == 2){
+					if (ret == 2) {
 						ptrcli->cli.state = 2;
-						ptrntr->state=1;
+						ptrntr->state = 1;
 						/*connect success!*/
 						openntrip(ptrntr);
 					}
@@ -751,35 +746,30 @@ static int startntripcli(stream_t *stream, dataRecvCallback callback, int ncli) 
 	return 1;
 }
 
-
-
-
-
-
-
 /**************************************NTRIP-CASTER******************************************************/
 static int accept_nb(ntrip_caster_t* ptrcas) {
 	struct sockaddr_in addr;
 	struct epoll_event ev;
 	socklen_t len = sizeof(struct sockaddr);
-	stream_t *stream=(stream_t*)ptrcas->host;
+	stream_t *stream = (stream_t*) ptrcas->host;
 	/*if it is ET mode ,here should be a loop*/
 	while (1) {
 		int fd = accept(ptrcas->svr.sock, (struct sockaddr*) &addr, &len);
 		if (fd == -1 && errno == EWOULDBLOCK)
 			break;
-		if (!setsock(fd)){
+		if (!setsock(fd)) {
 			/*can't set no-block */
 			printf("cant set no-block socket!\n");
 			close(fd);
 			continue;
 		}
 		/***************add client information**************************/
-		ntrip_svr_unit *ptrunit=(ntrip_svr_unit*)malloc(sizeof(ntrip_svr_unit));
+		ntrip_svr_unit *ptrunit = (ntrip_svr_unit*) malloc(
+				sizeof(ntrip_svr_unit));
 
-		tcpcli_t* cli=&ptrunit->tcpcli;
+		tcpcli_t* cli = &ptrunit->tcpcli;
 		ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
-		ev.data.ptr = (void*)ptrunit;
+		ev.data.ptr = (void*) ptrunit;
 		if (epoll_ctl(stream->efd, EPOLL_CTL_ADD, fd, &ev) == -1) {
 			perror("epoll_ctl failed! server break down!\n");
 			exit(1);
@@ -788,7 +778,7 @@ static int accept_nb(ntrip_caster_t* ptrcas) {
 		cli->snredy = 1;
 		initlock(&(cli->synccli));
 		cli->reconinv = 0;
-		cli->inactinv = 1000 * 7200; /*two hour for inactive socket*/
+		cli->inactinv = 1000 * 120; /*two minute for inactive socket*/
 		list_init(&cli->sndpkt.list);
 
 		/*update socket configure*/
@@ -800,38 +790,39 @@ static int accept_nb(ntrip_caster_t* ptrcas) {
 		strcpy(cli->cli.saddr, inet_ntoa(addr.sin_addr));
 		/***************************************************************/
 
-		ptrunit->state=0;
+		ptrunit->state = 0;
 
-		ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*)malloc(sizeof(ntrip_svr_unit_list));
-		ptrunitlist->unit=ptrunit;
+		ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*) malloc(
+				sizeof(ntrip_svr_unit_list));
+		ptrunitlist->unit = ptrunit;
 
 		/*update the unit_list host*/
-		ptrunitlist->host=(void*)&ptrcas->halfHead;
-		ptrunit->host=(void*)ptrunitlist;
+		ptrunitlist->host = (void*) &ptrcas->halfHead;
+		ptrunit->host = (void*) ptrunitlist;
 
 		/*update the unit bhandle*/
-		ptrunit->bhandle=0;
+		ptrunit->bhandle = 0;
 		/*********************add to the ntrip_cast_t queue******************/
-		list_add_tail(&ptrunitlist->list,&(ptrcas->halfHead.list));
+		list_add_tail(&ptrunitlist->list, &(ptrcas->halfHead.list));
 
-		printf("accept client :%d \n",ptrunit->tcpcli.cli.sock);
+		printf("accept client :%d \n", ptrunit->tcpcli.cli.sock);
 	}
 	return 1;
 }
-static ntrip_caster_t* openntripsvr(opt_t* opt){
+static ntrip_caster_t* openntripsvr(opt_t* opt) {
 
-	ntrip_caster_t *ntrsvr,ntrsvr0={{0}};
-	if(!(ntrsvr = (ntrip_caster_t*)malloc(sizeof(ntrip_caster_t)))){
+	ntrip_caster_t *ntrsvr, ntrsvr0 = { { 0 } };
+	if (!(ntrsvr = (ntrip_caster_t*) malloc(sizeof(ntrip_caster_t)))) {
 		perror("can't malloc memory for ntrip caster!\n");
 		exit(1);
 	}
 
-	*ntrsvr=ntrsvr0;
-	strcpy(ntrsvr->svr.saddr,"59.172.4.52");
-	ntrsvr->svr.port=7005;
-	if(!gentcp(&ntrsvr->svr,0)){
+	*ntrsvr = ntrsvr0;
+	strcpy(ntrsvr->svr.saddr, "59.172.4.52");
+	ntrsvr->svr.port = 7005;
+	if (!gentcp(&ntrsvr->svr, 0)) {
 		free(ntrsvr);
-		ntrsvr=NULL;
+		ntrsvr = NULL;
 		return NULL;
 	}
 	/*initial connected client list*/
@@ -841,206 +832,217 @@ static ntrip_caster_t* openntripsvr(opt_t* opt){
 	return ntrsvr;
 
 }
-static ntrip_svr_con_list* get_conlist(ntrip_caster_t* ptrcas,char* mount){
-	ntrip_svr_con_list* conHead,*ptrcon;
+static ntrip_svr_con_list* get_conlist(ntrip_caster_t* ptrcas, char* mount) {
+	ntrip_svr_con_list* conHead, *ptrcon;
 	conHead = &ptrcas->cliHead;
-	list_for_each_entry(ptrcon,&conHead->list,list){
-		if(!strncmp(ptrcon->mountpoint,mount,strlen(mount))){
+	list_for_each_entry(ptrcon,&conHead->list,list)
+	{
+		if (!strncmp(ptrcon->mountpoint, mount, strlen(mount))) {
 			return ptrcon;
 		}
 	}
 	return NULL;
 }
 
-static void gen_sourcetable(ntrip_caster_t* ptrcas,char* buffer){
-	ntrip_svr_unit_list* ptrsvr,*ptrsvrpos;
-	char mout[1024],msg[1024];
+static void gen_sourcetable(ntrip_caster_t* ptrcas, char* buffer) {
+	ntrip_svr_unit_list* ptrsvr, *ptrsvrpos;
+	char mout[1024], msg[1024];
 	ptrsvr = &ptrcas->svrHead;
-	strcpy(msg,"SOURCETABLE 200 OK\r\n"
+	strcpy(msg, "SOURCETABLE 200 OK\r\n"
 			"Content-Type: text/plain\r\n"
 			"Content-Length: %d\r\n");
-	int len=0;
-	list_for_each_entry(ptrsvrpos,&ptrsvr->list,list){
-		sprintf(mout,"STR;%s;;RTCM3; ; ; ; ; ; ; ; ; ; ; ; ; ; ; \r\n",((ntrip_svr_con_list*)ptrsvrpos->con_list)->mountpoint);
-		len+=strlen(mout);
-		strcat(msg,mout);
+	int len = 0;
+	list_for_each_entry(ptrsvrpos,&ptrsvr->list,list)
+	{
+		sprintf(mout, "STR;%s;;RTCM3; ; ; ; ; ; ; ; ; ; ; ; ; ; ; \r\n",
+				((ntrip_svr_con_list*) ptrsvrpos->con_list)->mountpoint);
+		len += strlen(mout);
+		strcat(msg, mout);
 	}
-	strcat(msg,"ENDSOURCETABLE\r\n");
-	len+=strlen("ENDSOURCETABLE\r\n");
-	sprintf(buffer,msg,len);
+	strcat(msg, "ENDSOURCETABLE\r\n");
+	len += strlen("ENDSOURCETABLE\r\n");
+	sprintf(buffer, msg, len);
 }
-static int parse_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas,char* buffer,int n,char* replymsg){
-	int ret=0;
-	char mountpoint[maxstrsize]={0};
-	char authpsd[maxstrsize]={0};
-	char msg[maxstrsize*2]={0};
-	ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*)ptrunit->host;
-	ntrip_svr_con_list* conlist=NULL;
+static int parse_request(ntrip_svr_unit* ptrunit, ntrip_caster_t* ptrcas,
+		char* buffer, int n, char* replymsg) {
+	int ret = 0;
+	char mountpoint[maxstrsize] = { '\0' };
+	char authpsd[maxstrsize] = { '\0' };
+	char msg[maxstrsize * 2] = { '\0' };
+	ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*) ptrunit->host;
+	ntrip_svr_con_list* conlist = NULL;
 	/*update the handle tag*/
-	ptrunit->bhandle=1;
+	ptrunit->bhandle = 1;
 
-	char* ptrcliReq=NULL,*ptrReq=NULL;
-	char* ptrsvrReq=NULL;
+	char* ptrcliReq = NULL, *ptrReq = NULL;
+	char* ptrsvrReq = NULL;
 
 	/*Compatible to other forms of request*/
-	strncpy(msg,buffer,n);
+	strncpy(msg, buffer, n);
 	ptrReq = lower_string(msg);
-	ptrcliReq=strstr(ptrReq,"get");
-	ptrsvrReq=strstr(ptrReq,"source");
-	int index=-1;
+	ptrcliReq = strstr(ptrReq, "get");
+	ptrsvrReq = strstr(ptrReq, "source");
+	int index = -1;
 
-	if(ptrcliReq){
-		index=index_string(ptrReq,*ptrcliReq);
-		if(index!=0){
-			strcpy(replymsg,"401 Unauthorized\r\n");
+	if (ptrcliReq) {
+		index = index_string(ptrReq, *ptrcliReq);
+		if (index != 0) {
+			strcpy(replymsg, "401 Unauthorized\r\n");
 			return 0;
 		}
-		while(buffer[index]!=' '){
+		while (buffer[index] != ' ') {
 			if (buffer[index] >= 'A' && buffer[index] <= 'Z')
 				buffer[index] += 32;
 			index++;
 		}
-	}else if(ptrsvrReq){
-		index=index_string(ptrReq,*ptrsvrReq);
-		if(index!=0){
-			strcpy(replymsg,"401 Unauthorized\r\n");
+	} else if (ptrsvrReq) {
+		index = index_string(ptrReq, *ptrsvrReq);
+		if (index != 0) {
+			strcpy(replymsg, "401 Unauthorized\r\n");
 			return 0;
 		}
-		while(buffer[index]!=' '){
+		while (buffer[index] != ' ') {
 			if (buffer[index] >= 'A' && buffer[index] <= 'Z')
 				buffer[index] += 32;
 			index++;
 		}
 	}
 
-
-	if(ptrcliReq){
+	if (ptrcliReq) {
 		/*client part*/
-		sscanf(strstr(buffer,"get"),"%*s%s",mountpoint);
-
+		sscanf(strstr(buffer, "get"), "%*s%s", mountpoint);
 
 		/*remove the /*/
-		if(mountpoint[0]=='/'){
-			char* ptr =mountpoint;
-			while(*ptr!='\0'){
-				*ptr=*(ptr+1);
+		if (mountpoint[0] == '/') {
+			char* ptr = mountpoint;
+			while (*ptr != '\0') {
+				*ptr = *(ptr + 1);
 				ptr++;
 			}
 		}
-		printf("ntrip client request mountpoint:%s\n",mountpoint);
-		if(!strstr(buffer,"Authorization: Basic")){
+		printf("ntrip client request mountpoint:%s\n", mountpoint);
+		if (!strstr(buffer, "Authorization: Basic")) {
 			/*generate source table message*/
-			gen_sourcetable(ptrcas,replymsg);
+			gen_sourcetable(ptrcas, replymsg);
 
 			return 0;
-		}else{
-			sscanf(strstr(buffer,"Authorization: Basic"),"%*s%s",authpsd);
+		} else {
+			sscanf(strstr(buffer, "Authorization: Basic"), "%*s%s", authpsd);
 
-			if(0){
+			if (0) {
 				/*failed to authorized*/
-				sprintf(replymsg,"Server: NtripCaster/1.0\r\n"
-					 "WWW-Authenticate: Basic realm=\"/%s\"\r\n"
-					 "Content-Type: text/html\r\n"
-					 "Connection: close\r\n"
-					 "<html><head><title>401 Unauthorized</title></head><body bgcolor=black text=white\r\n"
-								 "link=blue alink=red>\r\n"
-					 "<h1><center>The server does not recognize your privileges to the requested entity\r\n"
-								 "stream</center></h1>\r\n"
-					 "</body></html>",mountpoint);
+				sprintf(replymsg,
+						"Server: NtripCaster/1.0\r\n"
+								"WWW-Authenticate: Basic realm=\"/%s\"\r\n"
+								"Content-Type: text/html\r\n"
+								"Connection: close\r\n"
+								"<html><head><title>401 Unauthorized</title></head><body bgcolor=black text=white\r\n"
+								"link=blue alink=red>\r\n"
+								"<h1><center>The server does not recognize your privileges to the requested entity\r\n"
+								"stream</center></h1>\r\n"
+								"</body></html>", mountpoint);
 				return 0;
 			}
 		}
-		conlist = get_conlist(ptrcas,mountpoint);
-		if(conlist==NULL){
-			gen_sourcetable(ptrcas,replymsg);
+		conlist = get_conlist(ptrcas, mountpoint);
+		if (conlist == NULL) {
+			gen_sourcetable(ptrcas, replymsg);
 			return 0;
-		}
-		else{
+		} else {
 			/*update the client*/
 			list_del(&ptrunitlist->list);
-			list_add_tail(&ptrunitlist->list,&conlist->cli_list.list);
+			list_add_tail(&ptrunitlist->list, &conlist->cli_list.list);
 			//update the configure
-			ptrunit->state=1;
-			ptrunit->type =0;
+			ptrunit->state = 1;
+			ptrunit->type = 0;
 			/*change the host address*/
-			ptrunitlist->host=(void*)&ptrcas->cliHead;
+			ptrunitlist->host = (void*) &ptrcas->cliHead;
 
 			/*send to the client*/
-			sprintf(replymsg,"ICY 200 OK\r\n");
-			send_nb(&ptrunit->tcpcli,replymsg,strlen(replymsg));
+			sprintf(replymsg, "ICY 200 OK\r\n");
+			send_nb(&ptrunit->tcpcli, replymsg, strlen(replymsg));
 
 			return 1;
 		}
-	}else if(ptrsvrReq){
+	} else if (ptrsvrReq) {
 		char psd[256];
-		sscanf(strstr(buffer,"source"),"%*s%s%s",psd,mountpoint);
+		sscanf(strstr(buffer, "source"), "%*s%s%s", psd, mountpoint);
 		/*remove the /*/
-		if(mountpoint[0]=='/'){
-			char* ptr =mountpoint;
-			while(*ptr!='\0'){
-				*ptr=*(ptr+1);
+		if (mountpoint[0] == '/') {
+			char* ptr = mountpoint;
+			while (*ptr != '\0') {
+				*ptr = *(ptr + 1);
 				ptr++;
 			}
 		}
-		if(strlen(mountpoint)>100){
-			strcpy(replymsg,"401 Unauthorized\r\n : mountpoint size too long!\r\n");
+		if (strlen(mountpoint) > 100) {
+			strcpy(replymsg,
+					"401 Unauthorized\r\n : mountpoint size too long!\r\n");
 			return 0;
 		}
 		//check for mountpoint int the caster
-
-
-		printf("svr connected success! psd: %s mountpoint: %s \n",psd,mountpoint);
+		if (get_conlist(ptrcas, mountpoint)) {
+			strcpy(replymsg,
+					"401 Unauthorized\r\n : mountpoint already exist!\r\n");
+			return 0;
+		}
+		printf("svr connected success! psd: %s mountpoint: %s \n", psd,
+				mountpoint);
 
 		/*server part*/
 		//delete from the original queue and add to the server queue
 		list_del(&ptrunitlist->list);
-		list_add_tail(&ptrunitlist->list,&ptrcas->svrHead.list);
+		list_add_tail(&ptrunitlist->list, &ptrcas->svrHead.list);
 
 		//create the corresponding connected-list and init the variable
-		conlist = (ntrip_svr_con_list*)malloc(sizeof(ntrip_svr_con_list));
+		conlist = (ntrip_svr_con_list*) malloc(sizeof(ntrip_svr_con_list));
 		list_init(&conlist->cli_list.list);
-		strcpy(conlist->mountpoint,mountpoint);
-		list_add_tail(&conlist->list,&ptrcas->cliHead.list);
+		strcpy(conlist->mountpoint, mountpoint);
+		list_add_tail(&conlist->list, &ptrcas->cliHead.list);
 
 		//update the list host
-		ptrunitlist->con_list=(void*)conlist;
-		ptrunitlist->host=(void*)&ptrcas->svrHead;
+		ptrunitlist->con_list = (void*) conlist;
+		ptrunitlist->host = (void*) &ptrcas->svrHead;
 
 		//update the configure
-		ptrunit->state=1;
-		ptrunit->type=1;
+		ptrunit->state = 1;
+		ptrunit->type = 1;
 
 		//remember to send the corresponding answer message to the server
-		sprintf(replymsg,"ICY 200 OK\r\n");
-		send_nb(&ptrunit->tcpcli,replymsg,strlen(replymsg));
+		sprintf(replymsg, "ICY 200 OK\r\n");
+		send_nb(&ptrunit->tcpcli, replymsg, strlen(replymsg));
 		return 1;
 	}
 	return 1;
 
 }
 /*no source server input*/
-static void svr_close_conlist(ntrip_svr_con_list* conlist,ntrip_caster_t* ptrcas){
-	ntrip_svr_unit_list* ptrunitHead,*ptrunitpos;
+static void svr_close_conlist(ntrip_svr_con_list* conlist,
+		ntrip_caster_t* ptrcas) {
+	ntrip_svr_unit_list* ptrunitHead, *ptrunitpos;
 	ptrunitHead = &conlist->cli_list;
 
-	stream_t* stream = (stream_t*)ptrcas->host;
+	stream_t* stream = (stream_t*) ptrcas->host;
 
 	/*client packet*/
 
-	packet_list* ptrpakHead,*ptrpakpos;
+	packet_list* ptrpakHead, *ptrpakpos;
 
 	while (!list_empty(&ptrunitHead->list)) {
-		ptrunitpos = list_entry(ptrunitHead->list.next, typeof(*ptrunitpos), list);
+		ptrunitpos = list_entry(ptrunitHead->list.next, typeof(*ptrunitpos),
+				list);
 
 		//REMOVE FROM THE SERVER
-		epoll_ctl(stream->efd,EPOLL_CTL_DEL,ptrunitpos->unit->tcpcli.cli.sock,NULL);
+		epoll_ctl(stream->efd, EPOLL_CTL_DEL, ptrunitpos->unit->tcpcli.cli.sock,
+		NULL);
 		close(ptrunitpos->unit->tcpcli.cli.sock);
 
 		/************free the unsent message***********************/
-		ptrpakHead=&ptrunitpos->unit->tcpcli.sndpkt;
+		ptrpakHead = &ptrunitpos->unit->tcpcli.sndpkt;
 
-		while(!list_empty(&ptrpakHead->list)){
-			ptrpakpos = list_entry(ptrpakHead->list.next,typeof(*ptrpakpos),list);
+		while (!list_empty(&ptrpakHead->list)) {
+			ptrpakpos = list_entry(ptrpakHead->list.next, typeof(*ptrpakpos),
+					list);
 			list_del(&ptrpakpos->list);
 			free(ptrpakpos);
 		}
@@ -1051,216 +1053,313 @@ static void svr_close_conlist(ntrip_svr_con_list* conlist,ntrip_caster_t* ptrcas
 		free(ptrunitpos);
 	}
 
-	list_del(&conlist->list,&ptrcas->cliHead.list);
+	list_del(&conlist->list, &ptrcas->cliHead.list);
 	free(conlist);
-	conlist=NULL;
+	conlist = NULL;
 }
 
 /*send to the client*/
-static void send_cli(ntrip_svr_con_list* conlist,char* buffer,int n){
-	ntrip_svr_unit_list *ptrunitHead,*ptrunitpos;
+static void send_cli(ntrip_caster_t* ptrcas,ntrip_svr_con_list* conlist, char* buffer, int n) {
+	ntrip_svr_unit_list *ptrunitHead, *ptrunitpos,*ptrunittmp;
+	stream_t* stream=(stream_t*)ptrcas->host;
+	int ret;
 	ptrunitHead=&conlist->cli_list;
+	for(ptrunitpos=list_entry(ptrunitHead->list.next,typeof(*ptrunitpos),list);
+			&ptrunitpos->list!=&ptrunitHead->list;){
+		if(-1==send_nb(&ptrunitpos->unit->tcpcli, buffer, n)){
+			ptrunittmp=list_entry(ptrunitpos->list.next,typeof(*ptrunitpos),list);
 
-//	while(!list_empty(&ptrunitHead->list)){
-//		ptrunitpos=list_entry(ptrunitHead->list.next,typeof(*ptrunitpos),list);
-//		send_nb(&ptrunitpos->unit->tcpcli,buffer,n);
-//	}
-	list_for_each_entry(ptrunitpos,&ptrunitHead->list,list){
-		send_nb(&ptrunitpos->unit->tcpcli,buffer,n);
+			/*update the data structure*/
+			list_del(&ptrunitpos->list);
+			epoll_ctl(stream->efd, EPOLL_CTL_DEL, ptrunitpos->unit->tcpcli.cli.sock,
+					NULL);
+			close(ptrunitpos->unit->tcpcli.cli.sock);
+			free(ptrunitpos->unit);
+			free(ptrunitpos);
+			ptrunitpos = ptrunittmp;
+		}else{
+			ptrunitpos=list_entry(ptrunitpos->list.next,typeof(*ptrunitpos),list);
+		}
 	}
 }
-static int handle_request(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas){
-	char buffer[maxstrsize*2];
-	char replymsg[maxstrsize];
+static int handle_request(ntrip_svr_unit* ptrunit, ntrip_caster_t* ptrcas) {
+	char buffer[maxstrsize * 2] = { '\0' };
+	char replymsg[maxstrsize] = { '\0' };
 	int nread;
-	while(1){
+	while (1) {
 		nread = recv(ptrunit->tcpcli.cli.sock, buffer, sizeof(buffer), 0);
 		if (nread < 0
 				&& ( errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN)) {
 			return 1;
 		} else if (nread <= 0) {
-			stream_t* stream = (stream_t*)ptrcas->host;
-			epoll_ctl(stream->efd, EPOLL_CTL_DEL, ptrunit->tcpcli.cli.sock, NULL);
+			stream_t* stream = (stream_t*) ptrcas->host;
+			epoll_ctl(stream->efd, EPOLL_CTL_DEL, ptrunit->tcpcli.cli.sock,
+			NULL);
 			close(ptrunit->tcpcli.cli.sock);
-			printf("unauthorized client close stream ! fd:%d\n",ptrunit->tcpcli.cli.sock);
-			ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*)ptrunit->host;
+			printf("unauthorized client close stream ! fd:%d\n",
+					ptrunit->tcpcli.cli.sock);
+			ntrip_svr_unit_list* ptrunitlist =
+					(ntrip_svr_unit_list*) ptrunit->host;
 			list_del(&ptrunitlist->list);
 			free(ptrunit);
 			free(ptrunitlist);
-			ptrunit=NULL;
+			ptrunit = NULL;
 			return 0;
 		}
-		if(nread<sizeof(buffer))
-			buffer[nread]='\0';
 
 		printf("the request msg is:\n");
-		printf("%s\n",buffer);
+		printf("%s\n", buffer);
 
-		if(!(parse_request(ptrunit,ptrcas,buffer,nread,replymsg))){
+		if (!(parse_request(ptrunit, ptrcas, buffer, nread, replymsg))) {
 			/*	 failed to authorized	*/
 
 			printf("authorized failed!\n");
 			/*generate sending-back message */
 
-			if(send_nb(&ptrunit->tcpcli,replymsg,strlen(replymsg))){
+			if (send_nb(&ptrunit->tcpcli, replymsg, strlen(replymsg))) {
 				/*remove from the half-connected list*/
 				ntrip_svr_unit_list* ptrunitlist =
 						(ntrip_svr_unit_list*) ptrunit->host;
 				list_del(&ptrunitlist->list);
 
 				/*close the client*/
-				stream_t* stream = (stream_t*)ptrcas->host;
-				epoll_ctl(stream->efd, EPOLL_CTL_DEL, ptrunit->tcpcli.cli.sock, NULL);
+				stream_t* stream = (stream_t*) ptrcas->host;
+				epoll_ctl(stream->efd, EPOLL_CTL_DEL, ptrunit->tcpcli.cli.sock,
+				NULL);
 				close(ptrunit->tcpcli.cli.sock);
 
 				free(ptrunit);
 				free(ptrunitlist);
-				ptrunit=NULL;
+				ptrunit = NULL;
 				return 0;
 			}
 		}
 	}
 }
-static int handle_source(ntrip_svr_unit* ptrunit,ntrip_caster_t* ptrcas){
+static int handle_source(ntrip_svr_unit* ptrunit, ntrip_caster_t* ptrcas) {
 	char buffer[maxstrsize];
 	int nread;
-	ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*)ptrunit->host;
+	ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*) ptrunit->host;
 	ntrip_svr_con_list* ptrconlist;
-	stream_t* stream=(stream_t*)ptrcas->host;
-	while(1){
+	stream_t* stream = (stream_t*) ptrcas->host;
+	while (1) {
 		nread = recv(ptrunit->tcpcli.cli.sock, buffer, sizeof(buffer), 0);
 		if (nread < 0
 				&& ( errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN)) {
 			return 1;
 		} else if (nread <= 0) {
-			switch(ptrunit->type){
+			switch (ptrunit->type) {
 			/*client closed*/
 			case 0:
 				/*update the epoll configure*/
-				printf("authorized client close stream ! fd:%d\n",ptrunit->tcpcli.cli.sock);
+				printf("authorized client close stream ! fd:%d\n",
+						ptrunit->tcpcli.cli.sock);
 
-				epoll_ctl(stream->efd, EPOLL_CTL_DEL, ptrunit->tcpcli.cli.sock, NULL);
+				epoll_ctl(stream->efd, EPOLL_CTL_DEL, ptrunit->tcpcli.cli.sock,
+				NULL);
 				close(ptrunit->tcpcli.cli.sock);
 
 				/*free the unit*/
 				list_del(&ptrunitlist->list);
 				free(ptrunit);
 				free(ptrunitlist);
-				ptrunit=NULL;
+				ptrunit = NULL;
 				return 0;
-			/*server closed*/
+				/*server closed*/
 			case 1:
 				/*free the connected list*/
-				printf("authorized server close stream ! fd:%d\n",ptrunit->tcpcli.cli.sock);
+				printf("authorized server close stream ! fd:%d\n",
+						ptrunit->tcpcli.cli.sock);
 
-				ptrconlist = (ntrip_svr_con_list*)ptrunitlist->con_list;
-				svr_close_conlist(ptrconlist,ptrcas);
+				ptrconlist = (ntrip_svr_con_list*) ptrunitlist->con_list;
+				svr_close_conlist(ptrconlist, ptrcas);
 
 				/*free the server*/
-				epoll_ctl(stream->efd, EPOLL_CTL_DEL, ptrunit->tcpcli.cli.sock, NULL);
+				epoll_ctl(stream->efd, EPOLL_CTL_DEL, ptrunit->tcpcli.cli.sock,
+				NULL);
 				close(ptrunit->tcpcli.cli.sock);
 				/*free the unit*/
 				list_del(&ptrunitlist->list);
 				free(ptrunit);
 				free(ptrunitlist);
-				ptrunit=NULL;
+				ptrunit = NULL;
 				return 0;
 			}
 			break;
 		}
 		/*ignore the authorized client sending-message*/
-		if(ptrunit->type==0)
+		if (ptrunit->type == 0)
 			continue;
 
-		ptrconlist=(ntrip_svr_con_list*)ptrunitlist->con_list;
-		send_cli(ptrconlist,buffer,nread);
+		ptrconlist = (ntrip_svr_con_list*) ptrunitlist->con_list;
+		send_cli(ptrcas,ptrconlist, buffer, nread);
 	}
 }
-static void startntripcaster(stream_t* stream){
+static void startntripcaster(stream_t* stream) {
 
 	ntrip_caster_t* ntrsvr;
 
-	int nfd, i,bfree;
+	int nfd, i, bfree, nsend;
+	char buffer[maxstrsize] = { '\0' };
 
 	struct epoll_event events[MAXEPOLL], ev;
 
 	/****************Initial Epoll Configure****************************/
-	stream->mode=MODE_NTRIPSVR;
-	stream->type=STREAM_TCP;
+	stream->mode = MODE_NTRIPSVR;
+	stream->type = STREAM_TCP;
 	stream->efd = epoll_create(MAXEPOLL);
 
 	/******************************************************************/
-	if(!(ntrsvr=openntripsvr(NULL))){
+	if (!(ntrsvr = openntripsvr(NULL))) {
 		return;
 	}
 	printf("opensvr successfully!\n");
 
-	ntrsvr->host=(void*)stream;
+	ntrsvr->host = (void*) stream;
 
 	ev.events = EPOLLIN | EPOLLET;
-	ev.data.fd=ntrsvr->svr.sock;
+	ev.data.fd = ntrsvr->svr.sock;
 	epoll_ctl(stream->efd, EPOLL_CTL_ADD, ntrsvr->svr.sock, &ev);
-	while(1){
-		nfd = epoll_wait(stream->efd, events, MAXEPOLL, -1);
-		for(i=0;i<nfd;i++){
-			if(events[i].data.fd==ntrsvr->svr.sock&&(events[i].events&EPOLLIN)){
-					accept_nb(ntrsvr);
-			}else if(events[i].events&EPOLLIN){
-				ntrip_svr_unit* ptrunit = (ntrip_svr_unit*)events[i].data.ptr;
-				switch(ptrunit->state){
+
+	ntrip_svr_unit_list* ptrhead, *ptrpos, *ptrrecu;
+
+
+
+	/*ignore the SIGPIPE signal*/
+	struct sigaction sa;
+	sa.sa_handler = SIG_IGN; //设定接受到指定信号后的动作为忽略
+	sa.sa_flags = 0;
+	if (sigemptyset(&sa.sa_mask) == -1 ||   //初始化信号集为空
+			sigaction(SIGPIPE, &sa, 0) == -1) {   //屏蔽SIGPIPE信号
+		perror("failed to ignore SIGPIPE; sigaction");
+		exit(EXIT_FAILURE);
+	}
+
+	while (1) {
+		//wait interval 120s
+		nfd = epoll_wait(stream->efd, events, MAXEPOLL, 120 * 1000);
+		for (i = 0; i < nfd; i++) {
+			if (events[i].data.fd == ntrsvr->svr.sock
+					&& (events[i].events & EPOLLIN)) {
+				accept_nb(ntrsvr);
+			} else if (events[i].events & EPOLLIN) {
+				ntrip_svr_unit* ptrunit = (ntrip_svr_unit*) events[i].data.ptr;
+				switch (ptrunit->state) {
 				/*client or server request*/
 				case 0:
-					bfree=handle_request(ptrunit,ntrsvr);
+					bfree = handle_request(ptrunit, ntrsvr);
 					break;
-				/*server source stream*/
+					/*server source stream*/
 				case 1:
-					bfree=handle_source(ptrunit,ntrsvr);
+					ptrunit->tcpcli.cli.tact = tickget();
+					bfree = handle_source(ptrunit, ntrsvr);
 					break;
 				}
-				if(!bfree)
+				if (!bfree)
 					continue;
-			}if(events[i].events&EPOLLOUT){
-				ntrip_svr_unit* ptrunit = (ntrip_svr_unit*)events[i].data.ptr;
+			}
+			if (events[i].events & EPOLLOUT) {
+				ntrip_svr_unit* ptrunit = (ntrip_svr_unit*) events[i].data.ptr;
 
-				if(ptrunit->bhandle&&send_packet(&ptrunit->tcpcli)){
-					if(ptrunit->state==0){
-						epoll_ctl(stream->efd,EPOLL_CTL_DEL,ptrunit->tcpcli.cli.sock,NULL);
-						close(ptrunit->tcpcli.cli.sock);
-						ntrip_svr_unit_list* ptrunitlist = (ntrip_svr_unit_list*)ptrunit->host;
-						list_del(&ptrunitlist->list);
+				if (ptrunit->bhandle ){
+					int ret =send_packet(&ptrunit->tcpcli);
+					if(ret!=0){
+						if (ptrunit->state == 0 || ret ==-1) {
+							epoll_ctl(stream->efd, EPOLL_CTL_DEL,
+									ptrunit->tcpcli.cli.sock, NULL);
+							close(ptrunit->tcpcli.cli.sock);
+							ntrip_svr_unit_list* ptrunitlist =
+									(ntrip_svr_unit_list*) ptrunit->host;
+							list_del(&ptrunitlist->list);
+							/*if the client socket closed,should clear the packet memory*/
+							packet_list* ptrpakHead, *ptrpakpos;
+							if(ret==-1){
+								ptrpakHead = &ptrunit->tcpcli.sndpkt;
 
-						free(ptrunit);
-						free(ptrunitlist);
-						ptrunit=NULL;
+								while (!list_empty(&ptrpakHead->list)) {
+									ptrpakpos = list_entry(
+											ptrpakHead->list.next,
+											typeof(*ptrpakpos), list);
+									list_del(&ptrpakpos->list);
+									free(ptrpakpos);
+								}
+							}
+							free(ptrunit);
+							free(ptrunitlist);
+							ptrunit = NULL;
+						}
 					}
 				}
 			}
 		}
 		/*clear the timeout clients*/
+		ptrhead = &ntrsvr->halfHead;
+		for (ptrpos = list_entry(ptrhead->list.next, typeof(*ptrpos), list);
+				&ptrpos->list != &ptrhead->list;) {
+			if (tickget() - ptrpos->unit->tcpcli.cli.tact
+					> ptrpos->unit->tcpcli.inactinv) {
+
+				ptrrecu = list_entry(ptrpos->list.next, typeof(*ptrpos), list);
+
+				list_del(&ptrpos->list);
+				/*close the corresponding timeout socket*/
+				epoll_ctl(stream->efd, EPOLL_CTL_DEL,
+						ptrpos->unit->tcpcli.cli.sock, NULL);
+				close(ptrpos->unit->tcpcli.cli.sock);
+				free(ptrpos->unit);
+				free(ptrpos);
+
+				ptrpos = ptrrecu;
+
+			} else {
+				ptrpos = list_entry(ptrpos->list.next, typeof(*ptrpos), list);
+			}
+		}
+		/*clear the closed server*/
+		ptrhead = &ntrsvr->svrHead;
+		strcpy(buffer, "test_active");
+		for (ptrpos = list_entry(ptrhead->list.next, typeof(*ptrpos), list);
+				&ptrpos->list != &ptrhead->list;) {
+			if (tickget() - ptrpos->unit->tcpcli.cli.tact
+					> ptrpos->unit->tcpcli.inactinv) {
+				nsend = send(ptrpos->unit->tcpcli.cli.sock, buffer,
+						strlen(buffer),0);
+				if (nsend
+						<= 0&& errno!=EINTR && errno!=EWOULDBLOCK && errno!=EAGAIN) {
+					ptrrecu = list_entry(ptrpos->list.next, typeof(*ptrpos),
+							list);
+
+					list_del(&ptrpos->list);
+					epoll_ctl(stream->efd, EPOLL_CTL_DEL,
+							ptrpos->unit->tcpcli.cli.sock, NULL);
+					close(ptrpos->unit->tcpcli.cli.sock);
+					free(ptrpos->unit);
+					free(ptrpos);
+
+					ptrpos = ptrrecu;
+
+					continue;
+				}
+			}
+			ptrpos = list_entry(ptrpos->list.next, typeof(*ptrpos), list);
+		}
 	}
 }
 /*****************************************NTRIP-SERVER******************************************************************/
-static void startntripsvr(stream_t* stream){
-
-
-
-
+static void startntripsvr(stream_t* stream) {
 
 }
-int main(int argc,char* args[]){
+int main(int argc, char* args[]) {
 
-
-	if(strstr(args[1],"caster")){
+	if (strstr(args[1], "caster")) {
 		stream_t stream;
 		startntripcaster(&stream);
-	}else if(strstr(args[1],"cli")){
+	} else if (strstr(args[1], "cli")) {
 		stream_t stream;
-		startntripcli(&stream,ntrrecv_callback,1);
-	}else if(strstr(args[1],"svr")){
+		startntripcli(&stream, ntrrecv_callback, 1);
+	} else if (strstr(args[1], "svr")) {
 		stream_t stream;
-		ntripsvr(&stream,NULL,1);
+		ntripsvr(&stream, NULL, 1);
 	}
 }
-
-
 
