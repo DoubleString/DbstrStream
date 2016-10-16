@@ -1329,15 +1329,16 @@ static void startntripcaster(stream_t* stream) {
 					ptrrecu = list_entry(ptrpos->list.next, typeof(*ptrpos),
 							list);
 
+					ntrip_svr_con_list* ptrconlist = (ntrip_svr_con_list*) ptrpos->con_list;
+					svr_close_conlist(ptrconlist, ntrsvr);
+
 					list_del(&ptrpos->list);
 					epoll_ctl(stream->efd, EPOLL_CTL_DEL,
 							ptrpos->unit->tcpcli.cli.sock, NULL);
 					close(ptrpos->unit->tcpcli.cli.sock);
 					free(ptrpos->unit);
 					free(ptrpos);
-
 					ptrpos = ptrrecu;
-
 					continue;
 				}
 			}
